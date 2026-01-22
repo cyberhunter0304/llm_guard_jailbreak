@@ -1,0 +1,25 @@
+# FastAPI Framework
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+
+# HTTP Client
+httpx==0.28.1
+
+# Data Validation
+pydantic==2.10.6
+pydantic-settings==2.7.1
+
+# Security & Jailbreak Detection
+llm-guard==0.3.15
+
+# Environment Variables
+python-dotenv==1.0.1
+
+# Logging
+python-json-logger==3.2.1
+
+# Type Hints
+typing-extensions==4.12.2
+
+# Optional: Performance
+orjson==3.10.14
