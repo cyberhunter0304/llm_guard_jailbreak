@@ -5,6 +5,7 @@ FastAPI with OpenRouter GPT-4o mini integration and comprehensive jailbreak dete
 
 from fastapi import FastAPI, HTTPException, status
 from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, validator
 from llm_guard.input_scanners import PromptInjection, Language, Toxicity
 from llm_guard.input_scanners.language import MatchType
@@ -27,6 +28,20 @@ app = FastAPI(
     redoc_url="/redoc"
 )
 
+# CORS Configuration - Allow React frontend to connect
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:3000",  # React development server
+        "http://localhost:5173",  # Vite development server
+        "http://127.0.0.1:3000",
+        "http://127.0.0.1:5173"
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 # Initialize scanners
 prompt_injection_scanner = PromptInjection(threshold=0.8)
 language_scanner = Language(valid_languages=["en"], match_type=MatchType.FULL, threshold=0.8)
@@ -34,7 +49,7 @@ toxicity_scanner = Toxicity(threshold=0.5)
 
 # OpenRouter configuration
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
-OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions" # OpenRouter API endpoint to receive chat completions
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 
 # Pydantic models
@@ -108,9 +123,7 @@ class StatsResponse(BaseModel):
 class JailbreakDetector:
     """Comprehensive jailbreak detection system"""
     
-    
     def __init__(self):
-        #Scanners available are initialized here
         self.scanners = {
             "prompt_injection": prompt_injection_scanner,
             "language": language_scanner,
@@ -137,7 +150,7 @@ class JailbreakDetector:
         
         for scanner_name, scanner in self.scanners.items():
             try:
-                sanitized, is_valid, risk_score = scanner.scan(prompt) #Scan function called here
+                sanitized, is_valid, risk_score = scanner.scan(prompt)
                 
                 results["detections"][scanner_name] = {
                     "is_valid": is_valid,
@@ -252,12 +265,12 @@ async def chat(request: ChatRequest):
     try:
         # Security scan
         logger.info(f"Scanning prompt: {request.prompt[:100]}...")
-        scan_results = detector.scan_prompt(request.prompt) #Calls scan_prompt Function
+        scan_results = detector.scan_prompt(request.prompt)
         
         # Main Jailbreak checker
-        if not scan_results.is_safe: #if not safe, block
+        if not scan_results.is_safe:
             logger.warning(f"Jailbreak detected - Risk level: {scan_results.risk_level}")
-            return JSONResponse( #returns here if it is a 403 response
+            return JSONResponse(
                 status_code=status.HTTP_403_FORBIDDEN,
                 content={
                     "success": False,
@@ -266,7 +279,7 @@ async def chat(request: ChatRequest):
                     "security_scan": scan_results.dict(),
                     "blocked": True
                 }
-            ) #sends this json response back to server.js (403)
+            )
         
         # Prompt is safe - call LLM
         logger.info("Security check passed - forwarding to LLM")
@@ -276,20 +289,21 @@ async def chat(request: ChatRequest):
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail="OpenRouter API key not configured. Please set OPENROUTER_API_KEY environment variable"
             )
-        # Call OpenRouter API function is called here to get LLM response (call_openrouter in server.js Line. 182)
-        llm_response = await call_openrouter(request.prompt, request.model) #Calls OpenRouter API with prompt and model
+        
+        # Call OpenRouter API
+        llm_response = await call_openrouter(request.prompt, request.model)
         
         # Extract response and return
-        assistant_message = llm_response.get("choices", [{}])[0].get("message", {}).get("content", "") #Extracts the message from the response
+        assistant_message = llm_response.get("choices", [{}])[0].get("message", {}).get("content", "")
         
-        return ChatResponse( #returns here if it is a 200 response
+        return ChatResponse(
             success=True,
             response=assistant_message,
             security_scan=scan_results,
             model=request.model,
             usage=llm_response.get("usage", {}),
             timestamp=datetime.utcnow().isoformat()
-        ) #sends this json response back to server.js (200)
+        )
         
     except HTTPException:
         raise
@@ -297,7 +311,7 @@ async def chat(request: ChatRequest):
         logger.error(f"Unexpected error: {str(e)}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"LLM Internal server error: {str(e)}"
+            detail=f"Internal server error: {str(e)}"
         )
 
 
@@ -362,6 +376,7 @@ async def startup_event():
     logger.info("🚀 Starting Jailbreak-Protected LLM API (FastAPI)")
     logger.info("=" * 80)
     logger.info(f"✓ Loaded {len(detector.scanners)} security scanners")
+    logger.info("✓ CORS enabled for React frontend")
     logger.info("✓ Endpoints:")
     logger.info("  - GET  /health       - Health check")
     logger.info("  - POST /api/chat     - Protected chat endpoint")

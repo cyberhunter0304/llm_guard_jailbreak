@@ -8,6 +8,9 @@ const JailbreakProtectedChat = () => {
   const [loading, setLoading] = useState(false);
   const messagesEndRef = useRef(null);
 
+  // FastAPI backend URL - directly connect to main.py
+  const FASTAPI_URL = process.env.REACT_APP_FASTAPI_URL || 'http://localhost:8000';
+
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   };
@@ -24,49 +27,51 @@ const JailbreakProtectedChat = () => {
     setInput('');
     setLoading(true);
 
-
-    // User Query is sent to the backend server.js /api/chat endpoint
+    // Send directly to FastAPI backend (main.py)
     try { 
-      const response = await fetch('http://localhost:3001/api/chat', {
+      const response = await fetch(`${FASTAPI_URL}/api/chat`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
           prompt: input,
-          model: 'openai/gpt-4o-mini' //model is hardcoded for now
+          model: 'openai/gpt-4o-mini'
         }),
       });
-      // Parse JSON response (transforming json string to object)
-      const data = await response.json(); //response from backend (server.js) is captured here
+      
+      // Parse JSON response
+      const data = await response.json();
 
       if (data.success) {
-        //if response is 200
-        const aiMessage = { //object to hold AI message
+        // Success response (200)
+        const aiMessage = {
           role: 'ai',
           content: data.response,
           security_scan: data.security_scan,
           timestamp: data.timestamp
         };
-        setMessages(prev => [...prev, aiMessage]); //adds AI message to chat
-      } else { //if response is 403 or any other error
+        setMessages(prev => [...prev, aiMessage]);
+      } else {
+        // Error response (403 or other)
         const errorMessage = {
           role: 'system',
-          content: data.error || 'An error occurred',
+          content: data.message || data.error || 'An error occurred',
           security_scan: data.security_scan,
           blocked: data.blocked,
           timestamp: new Date().toISOString()
         };
-        setMessages(prev => [...prev, errorMessage]); //aads error message to chat
+        setMessages(prev => [...prev, errorMessage]);
       }
     } catch (error) {
-      // network error or server down
+      // Network error or server down
       const errorMessage = {
         role: 'system',
-        content: 'Failed to connect to the server. Please try again.',
+        content: 'Failed to connect to the server. Please ensure FastAPI is running on port 8000.',
         timestamp: new Date().toISOString()
       };
       setMessages(prev => [...prev, errorMessage]);
+      console.error('Connection error:', error);
     } finally {
       setLoading(false);
     }
@@ -81,7 +86,6 @@ const JailbreakProtectedChat = () => {
 
   return (
     <> 
-    {/* HTML and CSS for the frontend */}
       <style>{`
         * {
           margin: 0;
@@ -441,13 +445,9 @@ const JailbreakProtectedChat = () => {
         {/* Header */}
         <div className="chat-header">
           <div className="header-content">
-                {/* <img
-                src="frontend\public\loco.png"
-                alt="Company Logo"
-                className="app-logo"
-                /> */}
             <div>
-              <h1 className="header-title">Jailbreak Detection</h1>            </div>
+              <h1 className="header-title">Jailbreak Detection</h1>
+            </div>
           </div>
         </div>
 
@@ -469,19 +469,17 @@ const JailbreakProtectedChat = () => {
                 <div className={`message-wrapper ${message.role}`}>
                   <div className={`message-bubble ${message.role}`}>
                     <div className="message-content">
-                    <div className="icon-wrapper">
-                    {message.role === 'user' && '👤'}
-
-                    {message.role === 'system' && '⚠️'}
-
-                    {message.role === 'ai' && (
-                        <img
-                        src={logo}
-                        alt="AI Logo"
-                        className="ai-logo-icon"
-                        />
-                    )}
-                    </div>
+                      <div className="icon-wrapper">
+                        {message.role === 'user' && '👤'}
+                        {message.role === 'system' && '⚠️'}
+                        {message.role === 'ai' && (
+                          <img
+                            src={logo}
+                            alt="AI Logo"
+                            className="ai-logo-icon"
+                          />
+                        )}
+                      </div>
                       <div className="message-text">
                         <p className="message-text-content">{message.content}</p>
                         
