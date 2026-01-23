@@ -28,14 +28,14 @@ app = FastAPI(
     redoc_url="/redoc"
 )
 
-# CORS Configuration - Allow React frontend to connect
+# CORS Configuration - FIXED to allow React frontend
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "http://localhost:3000",  # React development server
-        "http://localhost:5173",  # Vite development server
-        "http://127.0.0.1:3000",
-        "http://127.0.0.1:5173"
+        "http://localhost:3000",      # React dev server
+        "http://127.0.0.1:3000",      # Alternative localhost
+        "http://localhost:8000",      # If serving from same port
+        "http://0.0.0.0:8000",        # Fallback
     ],
     allow_credentials=True,
     allow_methods=["*"],

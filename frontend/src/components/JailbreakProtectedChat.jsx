@@ -6,6 +6,7 @@ const JailbreakProtectedChat = () => {
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
+  const [connectionStatus, setConnectionStatus] = useState('checking');
   const messagesEndRef = useRef(null);
 
   // FastAPI backend URL - directly connect to main.py
@@ -19,6 +20,36 @@ const JailbreakProtectedChat = () => {
     scrollToBottom();
   }, [messages]);
 
+  // Check backend connection on mount
+  useEffect(() => {
+    const checkConnection = async () => {
+      try {
+        console.log('🔍 Checking connection to:', `${FASTAPI_URL}/health`);
+        const response = await fetch(`${FASTAPI_URL}/health`, {
+          method: 'GET',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+        });
+        
+        if (response.ok) {
+          const data = await response.json();
+          console.log('✅ Backend connected:', data);
+          setConnectionStatus('connected');
+        } else {
+          console.error('❌ Backend returned error:', response.status);
+          setConnectionStatus('error');
+        }
+      } catch (error) {
+        console.error('❌ Failed to connect to backend:', error);
+        console.error('   Trying to connect to:', `${FASTAPI_URL}/health`);
+        setConnectionStatus('error');
+      }
+    };
+
+    checkConnection();
+  }, [FASTAPI_URL]);
+
   const sendMessage = async () => {
     if (!input.trim()) return;
 
@@ -28,8 +59,12 @@ const JailbreakProtectedChat = () => {
     setLoading(true);
 
     // Send directly to FastAPI backend (main.py)
-    try { 
-      const response = await fetch(`${FASTAPI_URL}/api/chat`, {
+    try {
+      const url = `${FASTAPI_URL}/api/chat`;
+      console.log('📤 Sending request to:', url);
+      console.log('📤 Payload:', { prompt: input, model: 'openai/gpt-4o-mini' });
+      
+      const response = await fetch(url, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -40,8 +75,12 @@ const JailbreakProtectedChat = () => {
         }),
       });
       
+      console.log('📥 Response status:', response.status);
+      console.log('📥 Response headers:', Object.fromEntries(response.headers.entries()));
+      
       // Parse JSON response
       const data = await response.json();
+      console.log('📥 Response data:', data);
 
       if (data.success) {
         // Success response (200)
@@ -65,13 +104,15 @@ const JailbreakProtectedChat = () => {
       }
     } catch (error) {
       // Network error or server down
+      console.error('💥 Connection error:', error);
+      console.error('   Was trying to reach:', `${FASTAPI_URL}/api/chat`);
+      
       const errorMessage = {
         role: 'system',
-        content: 'Failed to connect to the server. Please ensure FastAPI is running on port 8000.',
+        content: `Failed to connect to the server at ${FASTAPI_URL}. Please ensure FastAPI is running on port 8000. Error: ${error.message}`,
         timestamp: new Date().toISOString()
       };
       setMessages(prev => [...prev, errorMessage]);
-      console.error('Connection error:', error);
     } finally {
       setLoading(false);
     }
@@ -144,6 +185,29 @@ const JailbreakProtectedChat = () => {
           font-size: 14px;
           color: rgba(255,255,255,0.9);
           margin: 4px 0 0 0;
+        }
+
+        .connection-status {
+          margin-left: auto;
+          padding: 6px 12px;
+          border-radius: 8px;
+          font-size: 12px;
+          font-weight: 600;
+        }
+
+        .connection-status.connected {
+          background: rgba(34, 197, 94, 0.2);
+          color: #fff;
+        }
+
+        .connection-status.checking {
+          background: rgba(251, 191, 36, 0.2);
+          color: #fff;
+        }
+
+        .connection-status.error {
+          background: rgba(239, 68, 68, 0.2);
+          color: #fff;
         }
 
         .messages-container {
@@ -448,6 +512,11 @@ const JailbreakProtectedChat = () => {
             <div>
               <h1 className="header-title">Jailbreak Detection</h1>
             </div>
+            <div className={`connection-status ${connectionStatus}`}>
+              {connectionStatus === 'connected' && '✓ Connected'}
+              {connectionStatus === 'checking' && '⟳ Checking...'}
+              {connectionStatus === 'error' && '✗ Backend Offline'}
+            </div>
           </div>
         </div>
 
@@ -460,6 +529,11 @@ const JailbreakProtectedChat = () => {
                   <div className="lock-icon">🔒</div>
                   <h2 className="empty-title">Jailbreak Testing Simulation</h2>
                   <p className="empty-text">Your messages are protected with real-time jailbreak detection and content filtering.</p>
+                  {connectionStatus === 'error' && (
+                    <p style={{marginTop: '15px', color: '#dc2626', fontSize: '13px'}}>
+                      ⚠️ Backend not connected. Please start FastAPI server on port 8000.
+                    </p>
+                  )}
                 </div>
               </div>
             )}
@@ -487,7 +561,7 @@ const JailbreakProtectedChat = () => {
                           <div className={`security-scan ${message.security_scan.is_safe ? 'safe' : 'unsafe'}`}>
                             <div className="security-header">
                               <span className="security-icon">
-                                {message.security_scan.is_safe ? '✓' : '⚠'}
+                                {message.security_scan.is_safe ? '✔' : '⚠'}
                               </span>
                               <span className="security-level">
                                 Security: {message.security_scan.risk_level}
@@ -544,7 +618,7 @@ const JailbreakProtectedChat = () => {
               ✈️ {loading ? 'Sending...' : 'Send'}
             </button>
           </div>
-          <p className="footer-text">@ iNextLabs</p>
+          <p className="footer-text">@ iNextLabs | Backend: {FASTAPI_URL}</p>
         </div>
       </div>
     </>

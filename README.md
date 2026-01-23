@@ -16,9 +16,7 @@ source venv/bin/activate
 pip install -r requirements.txt
 
 # 3. Install Node.js dependencies
-cd backend
-npm install
-cd ../frontend
+cd frontend
 npm install
 cd ..
 
@@ -26,21 +24,11 @@ cd ..
 # Create .env in root directory with:
 echo "OPENROUTER_API_KEY=your_api_key_here" > .env
 
-# Create .env in backend directory with:
-cd backend
-echo "PORT=3001" > .env
-echo "FASTAPI_URL=http://localhost:8000" >> .env
-echo "OPENROUTER_API_KEY=your_api_key_here" >> .env
-cd ..
-
-# 5. Start all services (open 3 separate terminals)
+# 5. Start services (open 2 separate terminals)
 # Terminal 1 - FastAPI Backend:
 python main.py
 
-# Terminal 2 - Node.js Proxy:
-cd backend && npm run dev
-
-# Terminal 3 - React Frontend:
+# Terminal 2 - React Frontend:
 cd frontend && npm start
 
 # 6. Open browser at http://localhost:3000
@@ -54,14 +42,6 @@ cd frontend && npm start
 - **React** 18.x - UI framework
 - **JavaScript (ES6+)** - Programming language
 - **CSS3** - Styling with animations and gradients
-- **Axios** - HTTP client for API requests
-
-### Backend (Proxy Server)
-- **Node.js** 16.x+ - JavaScript runtime
-- **Express.js** - Web framework
-- **CORS** - Cross-origin resource sharing
-- **Axios** - HTTP client for forwarding requests
-- **dotenv** - Environment variable management
 
 ### Backend (API Server)
 - **Python** 3.8+ - Programming language
@@ -79,7 +59,6 @@ cd frontend && npm start
   - GPT-4o Mini
 
 ### Development Tools
-- **Nodemon** - Auto-restart for Node.js development
 - **Python Virtual Environment** - Isolated Python dependencies
 - **npm/pip** - Package managers
 
@@ -133,17 +112,7 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 3. Proxy Server Setup (Node.js)
-
-```bash
-# Navigate to backend directory
-cd backend
-
-# Install dependencies
-npm install
-```
-
-### 4. Frontend Setup (React)
+### 3. Frontend Setup (React)
 
 ```bash
 # Navigate to frontend directory
@@ -163,19 +132,9 @@ Create a `.env` file in the **root directory**:
 OPENROUTER_API_KEY=your_openrouter_api_key_here
 ```
 
-### Proxy Server Environment Variables
-
-Create a `.env` file in the **backend directory**:
-
-```env
-PORT=3001
-FASTAPI_URL=http://localhost:8000
-OPENROUTER_API_KEY=your_openrouter_api_key_here
-```
-
 ## 🎯 Running the Application
 
-You need to start all three services in separate terminals:
+You need to start both services in separate terminals:
 
 ### Terminal 1: FastAPI Backend
 
@@ -186,17 +145,7 @@ python main.py
 
 The backend will start on `http://localhost:8000`
 
-### Terminal 2: Node.js Proxy Server
-
-```bash
-# From backend directory
-cd backend
-npm run dev
-```
-
-The proxy server will start on `http://localhost:3001`
-
-### Terminal 3: React Frontend
+### Terminal 2: React Frontend
 
 ```bash
 # From frontend directory
@@ -216,13 +165,6 @@ The frontend will start on `http://localhost:3000`
 - **GET** `/api/stats` - API statistics and configuration
 - **GET** `/docs` - Interactive API documentation (Swagger UI)
 - **GET** `/redoc` - Alternative API documentation
-
-### Node.js Proxy (Port 3001)
-
-- **GET** `/health` - Proxy health check
-- **POST** `/api/chat` - Forwards to FastAPI chat endpoint
-- **POST** `/api/scan` - Forwards to FastAPI scan endpoint
-- **GET** `/api/stats` - Forwards to FastAPI stats endpoint
 
 ## 🧪 Testing the Security
 
@@ -270,7 +212,7 @@ Try these prompts to test the jailbreak detection:
 
 - `openai/gpt-4o-mini`
 
-## 📝 Project Structure
+## 📁 Project Structure
 
 ```
 llm_guard_jailbreak/
@@ -284,14 +226,8 @@ llm_guard_jailbreak/
 │   ├── public/
 │   └── package.json
 │
-├── backend/                     # Node.js proxy server
-│   ├── server.js
-│   ├── package.json
-│   └── .env
-│
-├── python_api/                  # Python API Folder
+├── backend/                     # Python FastAPI server
 │   └── main.py
-│
 │
 ├── requirements.txt             # Python dependencies
 ├── .env                         # Environment variables
@@ -319,22 +255,17 @@ LLM Guard supports additional scanners:
 - `Regex` - Custom regex patterns
 - `Sentiment` - Sentiment analysis
 
-## 🐛 Troubleshooting
+## 🛠 Troubleshooting
 
 ### Backend won't start
 - Ensure Python virtual environment is activated
 - Check all dependencies are installed: `pip install -r requirements.txt`
 - Verify `.env` file contains `OPENROUTER_API_KEY`
 
-### Proxy server connection errors
-- Ensure FastAPI backend is running on port 8000
-- Check `.env` file in backend directory
-- Verify CORS is properly configured
-
 ### Frontend connection issues
-- Ensure proxy server is running on port 3001
-- Check browser console for CORS errors
-- Verify all environment variables are set
+- Ensure FastAPI backend is running on port 8000
+- Check browser console for errors
+- Verify CORS is properly configured in `main.py`
 
 ### OpenRouter API errors
 - Verify your API key is valid
