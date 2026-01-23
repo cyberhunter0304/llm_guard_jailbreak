@@ -48,7 +48,8 @@ language_scanner = Language(valid_languages=["en"], match_type=MatchType.FULL, t
 toxicity_scanner = Toxicity(threshold=0.5)
 
 # OpenRouter configuration
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "") 
+print("OPEN ROUTER API KEY SET")
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 
