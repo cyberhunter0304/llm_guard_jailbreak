@@ -1,4 +1,4 @@
-## 🚀 Quick Setup (For Team Members)
+## 🚀 Quick Setup
 
 Get started in 5 minutes:
 
