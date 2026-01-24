@@ -482,54 +482,7 @@
         <!-- Arrow 2 -->
         <div class="arrow">
             <div class="arrow-line purple"></div>
-            <div class="arrow-label">2️⃣ HTTP POST /api/chat<br>Payload: {prompt, model}</div>
-        </div>
-
-        <!-- Layer 3: Middleware -->
-        <div class="layer middleware-layer">
-            <div class="layer-title">MIDDLEWARE LAYER</div>
-            <div class="component">
-                <div class="component-header purple-header">
-                    NODE.JS PROXY SERVER
-                    <div class="component-subtitle">Express.js on Port 3001 | server.js</div>
-                </div>
-                
-                <div class="sub-components">
-                    <div class="sub-box">
-                        <div class="sub-box-title">Middleware Stack</div>
-                        <ul>
-                            <li>CORS Handler</li>
-                            <li>JSON Parser</li>
-                            <li>Error Handler</li>
-                        </ul>
-                    </div>
-                    
-                    <div class="sub-box">
-                        <div class="sub-box-title">API Routes</div>
-                        <ul>
-                            <li>POST /api/chat</li>
-                            <li>POST /api/scan</li>
-                            <li>GET /api/stats</li>
-                            <li>GET /health</li>
-                        </ul>
-                    </div>
-                    
-                    <div class="sub-box">
-                        <div class="sub-box-title">Proxy Logic</div>
-                        <ul>
-                            <li>Request forwarding</li>
-                            <li>Response forwarding</li>
-                            <li>Error handling</li>
-                        </ul>
-                    </div>
-                </div>
-            </div>
-        </div>
-
-        <!-- Arrow 3 -->
-        <div class="arrow">
-            <div class="arrow-line orange"></div>
-            <div class="arrow-label">3️⃣ Proxy Forward<br>POST localhost:8000/api/chat</div>
+            <div class="arrow-label">2️⃣ HTTP POST /api/chat<br>Payload: {prompt, model} <br>POST localhost:8000/api/chat</div>
         </div>
 
         <!-- Layer 4: Backend -->
@@ -757,5 +710,5 @@ Body:
 
         <div class="arrow">
             <div class="arrow-line" style="height: 50px; background: #95A5A6;"></div>
-            <div class="arrow-label">FastAPI → Node.js → React → User UI</div>
+            <div class="arrow-label">FastAPI → React → User UI</div>
         </div>
