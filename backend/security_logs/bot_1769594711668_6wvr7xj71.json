@@ -1,0 +1,87 @@
+{
+  "bot_id": "bot_1769594711668_6wvr7xj71",
+  "created_at": "2026-01-28T10:05:13.950635",
+  "security_events": [
+    {
+      "timestamp": "2026-01-28T10:05:23.333371",
+      "prompt": "HELLO",
+      "prompt_length": 5,
+      "detections": {
+        "prompt_injection": {
+          "is_valid": true,
+          "risk_score": -1.0,
+          "detected": false,
+          "execution_time": 4.003658056259155
+        },
+        "toxicity": {
+          "is_valid": true,
+          "risk_score": -0.8,
+          "detected": false,
+          "execution_time": 5.306062459945679
+        },
+        "pii": {
+          "is_valid": true,
+          "risk_score": 0.0,
+          "detected": false,
+          "entities_found": 0,
+          "entity_types": [],
+          "entities": [],
+          "anonymized_prompt": "HELLO",
+          "anonymized": false,
+          "execution_time": 8.87202501296997
+        }
+      },
+      "risk_level": "SAFE",
+      "is_safe": true,
+      "scan_duration": 9.382736682891846,
+      "blocked": false,
+      "anonymized_prompt": null,
+      "llm_response": "Hello! How can I assist you today?",
+      "model_used": "openai/gpt-4o-mini",
+      "success": true
+    },
+    {
+      "timestamp": "2026-01-28T10:25:09.590590",
+      "prompt": "i want to watch porn",
+      "prompt_length": 20,
+      "detections": {
+        "prompt_injection": {
+          "is_valid": true,
+          "risk_score": -1.0,
+          "detected": false,
+          "execution_time": 3.4710984230041504
+        },
+        "toxicity": {
+          "is_valid": false,
+          "risk_score": 0.3,
+          "detected": true,
+          "execution_time": 5.596056699752808
+        },
+        "pii": {
+          "is_valid": true,
+          "risk_score": 0.0,
+          "detected": false,
+          "entities_found": 0,
+          "entity_types": [],
+          "entities": [],
+          "anonymized_prompt": "i want to watch porn",
+          "anonymized": false,
+          "execution_time": 7.847005128860474
+        }
+      },
+      "risk_level": "MEDIUM",
+      "is_safe": false,
+      "scan_duration": 8.551435708999634,
+      "blocked": true,
+      "anonymized_prompt": null,
+      "llm_response": null,
+      "block_reason": "Please ask your question respectfully. I'm here to help when you communicate in a kind manner."
+    }
+  ],
+  "total_prompts": 2,
+  "blocked_prompts": 1,
+  "pii_detections": 0,
+  "jailbreak_attempts": 0,
+  "toxicity_detections": 1,
+  "last_updated": "2026-01-28T10:25:09.590590"
+}

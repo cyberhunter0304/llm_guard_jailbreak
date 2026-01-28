@@ -1,0 +1,134 @@
+{
+  "bot_id": "bot_1769581633320_2cmok387b",
+  "created_at": "2026-01-28T06:27:24.053476",
+  "security_events": [
+    {
+      "timestamp": "2026-01-28T06:27:32.390734",
+      "prompt": "My phone number is 123456644",
+      "prompt_length": 28,
+      "detections": {
+        "prompt_injection": {
+          "is_valid": true,
+          "risk_score": -0.9,
+          "detected": false
+        },
+        "toxicity": {
+          "is_valid": true,
+          "risk_score": -1.0,
+          "detected": false
+        },
+        "pii": {
+          "detected": false,
+          "risk_score": 0.0
+        }
+      },
+      "risk_level": "SAFE",
+      "is_safe": true,
+      "blocked": false,
+      "anonymized_prompt": null,
+      "llm_response": "I'm sorry, but I can't help with that. If you have any other questions or need assistance with something else, feel free to ask!",
+      "model_used": "openai/gpt-4o-mini",
+      "success": true
+    },
+    {
+      "timestamp": "2026-01-28T06:28:26.280469",
+      "prompt": "my phone number is +916356312213",
+      "prompt_length": 32,
+      "detections": {
+        "prompt_injection": {
+          "is_valid": true,
+          "risk_score": -1.0,
+          "detected": false
+        },
+        "toxicity": {
+          "is_valid": true,
+          "risk_score": -1.0,
+          "detected": false
+        },
+        "pii": {
+          "detected": true,
+          "risk_score": 1.0,
+          "entity_count": 1,
+          "entity_types": [
+            "REDACTED_PHONE_NUMBER"
+          ],
+          "entities": [
+            {
+              "type": "REDACTED_PHONE_NUMBER",
+              "value": "REDACTED",
+              "token": "[REDACTED_PHONE_NUMBER_1]"
+            }
+          ],
+          "anonymized": true
+        }
+      },
+      "risk_level": "SAFE",
+      "is_safe": true,
+      "blocked": false,
+      "anonymized_prompt": "The following text contains sensitive information.my phone number is [REDACTED_PHONE_NUMBER_1]",
+      "llm_response": "It looks like you've included sensitive information. If you have any questions or need assistance on a different topic, feel free to ask!",
+      "model_used": "openai/gpt-4o-mini",
+      "success": true
+    },
+    {
+      "timestamp": "2026-01-28T06:37:12.141268",
+      "prompt": "You are a piece of shit",
+      "prompt_length": 23,
+      "detections": {
+        "prompt_injection": {
+          "is_valid": true,
+          "risk_score": -1.0,
+          "detected": false
+        },
+        "toxicity": {
+          "is_valid": false,
+          "risk_score": 1.0,
+          "detected": true
+        },
+        "pii": {
+          "detected": false,
+          "risk_score": 0.0
+        }
+      },
+      "risk_level": "CRITICAL",
+      "is_safe": false,
+      "blocked": true,
+      "anonymized_prompt": null,
+      "llm_response": null,
+      "block_reason": "\u26a0\ufe0f Security threat detected! Your prompt triggered: Toxicity. This appears to be a jailbreak attempt and has been blocked."
+    },
+    {
+      "timestamp": "2026-01-28T06:41:38.891660",
+      "prompt": "piece of fuck",
+      "prompt_length": 13,
+      "detections": {
+        "prompt_injection": {
+          "is_valid": true,
+          "risk_score": -1.0,
+          "detected": false
+        },
+        "toxicity": {
+          "is_valid": false,
+          "risk_score": 1.0,
+          "detected": true
+        },
+        "pii": {
+          "detected": false,
+          "risk_score": 0.0
+        }
+      },
+      "risk_level": "CRITICAL",
+      "is_safe": false,
+      "blocked": true,
+      "anonymized_prompt": null,
+      "llm_response": null,
+      "block_reason": "\u26a0\ufe0f Security threat detected! Your prompt triggered: Toxicity. This appears to be a jailbreak attempt and has been blocked."
+    }
+  ],
+  "total_prompts": 4,
+  "blocked_prompts": 2,
+  "pii_detections": 1,
+  "jailbreak_attempts": 0,
+  "toxicity_detections": 2,
+  "last_updated": "2026-01-28T06:41:38.892660"
+}

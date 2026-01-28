@@ -1,10 +1,10 @@
 import React from 'react';
-import JailbreakProtectedChat from './components/JailbreakProtectedChat';
+import AnalyticsDashboard from './components/AnalyticsDashboard';
 
 function App() {
   return (
     <div className="App">
-      <JailbreakProtectedChat />
+      <AnalyticsDashboard />
     </div>
   );
 }
