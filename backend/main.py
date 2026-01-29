@@ -1,7 +1,3 @@
-"""
-Main Application Module
-FastAPI application with guardrail cloud service endpoints
-"""
 from fastapi import FastAPI, HTTPException, status
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware

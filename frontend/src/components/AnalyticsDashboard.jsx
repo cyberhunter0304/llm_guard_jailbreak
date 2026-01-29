@@ -1,3 +1,4 @@
+import logo from './loco.png';
 import React, { useState, useEffect } from 'react';
 import { LineChart, Line, BarChart, Bar, PieChart, Pie, Cell, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, Area, AreaChart } from 'recharts';
 
@@ -14,6 +15,9 @@ const AnalyticsDashboard = () => {
   const [sortBy, setSortBy] = useState('date-desc');
   const [currentPage, setCurrentPage] = useState(1);
   const [itemsPerPage] = useState(20);
+  const [showExportMenu, setShowExportMenu] = useState(false);
+  const [selectedSessions, setSelectedSessions] = useState(new Set());
+  const [selectionMode, setSelectionMode] = useState(false);
   const [stats, setStats] = useState({
     totalSessions: 0,
     totalPrompts: 0,
@@ -23,7 +27,7 @@ const AnalyticsDashboard = () => {
     totalToxicity: 0
   });
 
-  const BACKEND_URL = 'http://localhost:8000';
+  const BACKEND_URL = `http://${window.location.hostname}:8000`;
 
   useEffect(() => {
     fetchAllSessions();
@@ -214,7 +218,18 @@ const AnalyticsDashboard = () => {
     return piiData;
   };
 
-  const exportToCSV = () => {
+  // Enhanced Export Functions
+  const downloadCSV = (data, filename) => {
+    const blob = new Blob([data], { type: 'text/csv;charset=utf-8;' });
+    const url = window.URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    a.click();
+    window.URL.revokeObjectURL(url);
+  };
+
+  const exportSummaryCSV = () => {
     const csvData = sessions.map(session => ({
       'Bot ID': session.bot_id,
       'Created': formatDate(session.created_at),
@@ -226,15 +241,179 @@ const AnalyticsDashboard = () => {
     }));
 
     const headers = Object.keys(csvData[0] || {}).join(',');
-    const rows = csvData.map(row => Object.values(row).join(',')).join('\n');
+    const rows = csvData.map(row => Object.values(row).map(val => `"${val}"`).join(',')).join('\n');
     const csv = `${headers}\n${rows}`;
     
-    const blob = new Blob([csv], { type: 'text/csv' });
+    downloadCSV(csv, `security-summary-${new Date().toISOString().split('T')[0]}.csv`);
+    setShowExportMenu(false);
+  };
+
+  const exportFullDataJSON = async () => {
+    const fullData = await Promise.all(
+      sessions.map(async (session) => {
+        try {
+          const response = await fetch(`${BACKEND_URL}/api/security/${session.bot_id}`);
+          const details = await response.json();
+          return details;
+        } catch (error) {
+          console.error(`Failed to fetch details for ${session.bot_id}:`, error);
+          return session;
+        }
+      })
+    );
+
+    const json = JSON.stringify(fullData, null, 2);
+    const blob = new Blob([json], { type: 'application/json' });
     const url = window.URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `security-analytics-${new Date().toISOString().split('T')[0]}.csv`;
+    a.download = `security-full-data-${new Date().toISOString().split('T')[0]}.json`;
     a.click();
+    window.URL.revokeObjectURL(url);
+    setShowExportMenu(false);
+  };
+
+  const exportPIIOnly = () => {
+    const piiSessions = sessions.filter(s => s.pii_detections > 0);
+    const csvData = piiSessions.map(session => ({
+      'Bot ID': session.bot_id,
+      'Created': formatDate(session.created_at),
+      'PII Detections': session.pii_detections,
+      'Total Prompts': session.total_prompts
+    }));
+
+    const headers = Object.keys(csvData[0] || {}).join(',');
+    const rows = csvData.map(row => Object.values(row).map(val => `"${val}"`).join(',')).join('\n');
+    const csv = `${headers}\n${rows}`;
+    
+    downloadCSV(csv, `pii-detections-${new Date().toISOString().split('T')[0]}.csv`);
+    setShowExportMenu(false);
+  };
+
+  const exportJailbreaksOnly = () => {
+    const jailbreakSessions = sessions.filter(s => s.jailbreak_attempts > 0);
+    const csvData = jailbreakSessions.map(session => ({
+      'Bot ID': session.bot_id,
+      'Created': formatDate(session.created_at),
+      'Jailbreak Attempts': session.jailbreak_attempts,
+      'Total Prompts': session.total_prompts
+    }));
+
+    const headers = Object.keys(csvData[0] || {}).join(',');
+    const rows = csvData.map(row => Object.values(row).map(val => `"${val}"`).join(',')).join('\n');
+    const csv = `${headers}\n${rows}`;
+    
+    downloadCSV(csv, `jailbreak-attempts-${new Date().toISOString().split('T')[0]}.csv`);
+    setShowExportMenu(false);
+  };
+
+  const exportToxicityOnly = () => {
+    const toxicitySessions = sessions.filter(s => s.toxicity_detections > 0);
+    const csvData = toxicitySessions.map(session => ({
+      'Bot ID': session.bot_id,
+      'Created': formatDate(session.created_at),
+      'Toxicity Detections': session.toxicity_detections,
+      'Total Prompts': session.total_prompts
+    }));
+
+    const headers = Object.keys(csvData[0] || {}).join(',');
+    const rows = csvData.map(row => Object.values(row).map(val => `"${val}"`).join(',')).join('\n');
+    const csv = `${headers}\n${rows}`;
+    
+    downloadCSV(csv, `toxicity-detections-${new Date().toISOString().split('T')[0]}.csv`);
+    setShowExportMenu(false);
+  };
+
+  const exportAllThreats = () => {
+    const threatSessions = sessions.filter(s => 
+      s.pii_detections > 0 || s.jailbreak_attempts > 0 || s.toxicity_detections > 0 || s.blocked_prompts > 0
+    );
+    const csvData = threatSessions.map(session => ({
+      'Bot ID': session.bot_id,
+      'Created': formatDate(session.created_at),
+      'Total Prompts': session.total_prompts,
+      'Blocked': session.blocked_prompts,
+      'PII': session.pii_detections,
+      'Jailbreaks': session.jailbreak_attempts,
+      'Toxicity': session.toxicity_detections,
+      'Total Threats': (session.pii_detections + session.jailbreak_attempts + session.toxicity_detections + session.blocked_prompts)
+    }));
+
+    const headers = Object.keys(csvData[0] || {}).join(',');
+    const rows = csvData.map(row => Object.values(row).map(val => `"${val}"`).join(',')).join('\n');
+    const csv = `${headers}\n${rows}`;
+    
+    downloadCSV(csv, `all-threats-${new Date().toISOString().split('T')[0]}.csv`);
+    setShowExportMenu(false);
+  };
+
+  const exportSelectedSessions = async () => {
+    if (selectedSessions.size === 0) {
+      alert('Please select at least one session to export');
+      return;
+    }
+
+    const selectedSessionsArray = Array.from(selectedSessions);
+    const selectedData = await Promise.all(
+      selectedSessionsArray.map(async (botId) => {
+        try {
+          const response = await fetch(`${BACKEND_URL}/api/security/${botId}`);
+          const details = await response.json();
+          return details;
+        } catch (error) {
+          console.error(`Failed to fetch details for ${botId}:`, error);
+          return sessions.find(s => s.bot_id === botId);
+        }
+      })
+    );
+
+    const json = JSON.stringify(selectedData, null, 2);
+    const blob = new Blob([json], { type: 'application/json' });
+    const url = window.URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `selected-sessions-${new Date().toISOString().split('T')[0]}.json`;
+    a.click();
+    window.URL.revokeObjectURL(url);
+    setShowExportMenu(false);
+    setSelectionMode(false);
+    setSelectedSessions(new Set());
+  };
+
+  const exportCurrentBot = async () => {
+    if (!botDetails || !selectedBot) {
+      alert('Please select a bot session first');
+      return;
+    }
+
+    const json = JSON.stringify(botDetails, null, 2);
+    const blob = new Blob([json], { type: 'application/json' });
+    const url = window.URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `bot-${selectedBot.substring(0, 12)}-${new Date().toISOString().split('T')[0]}.json`;
+    a.click();
+    window.URL.revokeObjectURL(url);
+    setShowExportMenu(false);
+  };
+
+  const toggleSessionSelection = (botId) => {
+    const newSelected = new Set(selectedSessions);
+    if (newSelected.has(botId)) {
+      newSelected.delete(botId);
+    } else {
+      newSelected.add(botId);
+    }
+    setSelectedSessions(newSelected);
+  };
+
+  const selectAllSessions = () => {
+    const allIds = new Set(filteredSessions.map(s => s.bot_id));
+    setSelectedSessions(allIds);
+  };
+
+  const deselectAllSessions = () => {
+    setSelectedSessions(new Set());
   };
 
   // Chart data preparation
@@ -394,7 +573,7 @@ const AnalyticsDashboard = () => {
         }
 
         .dashboard-header {
-          background: linear-gradient(135deg, #FF6B35 0%, #F7931E 100%);
+          background: linear-gradient(135deg, #fbfbfb 0%, #F15843 100%);
           color: white;
           padding: 32px;
           border-radius: 20px;
@@ -428,11 +607,13 @@ const AnalyticsDashboard = () => {
           display: flex;
           align-items: center;
           gap: 12px;
+          color: black;
         }
 
         .dashboard-subtitle {
           font-size: 16px;
           opacity: 0.95;
+          color: black;
         }
 
         .header-stats {
@@ -451,12 +632,14 @@ const AnalyticsDashboard = () => {
         .header-stat-value {
           font-size: 28px;
           font-weight: 700;
+          color: black;
         }
 
         .header-stat-label {
           font-size: 13px;
           opacity: 0.9;
           margin-top: 4px;
+          color: black;
         }
 
         .view-toggle {
@@ -479,14 +662,14 @@ const AnalyticsDashboard = () => {
         }
 
         .toggle-btn.active {
-          background: linear-gradient(135deg, #FF6B35 0%, #F7931E 100%);
+          background: linear-gradient(135deg, #F15843 0%, #fc7777 100%);
           color: white;
           box-shadow: 0 4px 12px rgba(255, 107, 53, 0.3);
         }
 
         .toggle-btn:hover:not(.active) {
           background: #f9fafb;
-          color: #FF6B35;
+          color: #f15843;
           transform: translateY(-2px);
         }
 
@@ -626,7 +809,7 @@ const AnalyticsDashboard = () => {
 
         .search-input:focus {
           outline: none;
-          border-color: #FF6B35;
+          border-color: #F15843;
           box-shadow: 0 0 0 3px rgba(255, 107, 53, 0.1);
         }
 
@@ -648,12 +831,12 @@ const AnalyticsDashboard = () => {
         }
 
         .filter-btn:hover {
-          border-color: #FF6B35;
-          color: #FF6B35;
+          border-color: #F15843;
+          color: #F15843;
         }
 
         .filter-btn.active {
-          background: linear-gradient(135deg, #FF6B35 0%, #F7931E 100%);
+          background: linear-gradient(135deg, #F15843 0%, #f5897b 100%);
           color: white;
           border-color: transparent;
         }
@@ -692,6 +875,7 @@ const AnalyticsDashboard = () => {
         .action-buttons {
           display: flex;
           gap: 8px;
+          position: relative;
         }
 
         .icon-btn {
@@ -718,6 +902,130 @@ const AnalyticsDashboard = () => {
           border-color: #ef4444;
           color: #ef4444;
           background: #fef2f2;
+        }
+
+        .icon-btn.success {
+          background: linear-gradient(135deg, #10b981 0%, #059669 100%);
+          color: white;
+          border: none;
+        }
+
+        .icon-btn.success:hover {
+          background: linear-gradient(135deg, #059669 0%, #047857 100%);
+          transform: translateY(-2px);
+        }
+
+        .export-menu {
+          position: absolute;
+          top: 100%;
+          right: 0;
+          margin-top: 8px;
+          background: white;
+          border: 2px solid #e5e7eb;
+          border-radius: 12px;
+          box-shadow: 0 8px 24px rgba(0,0,0,0.12);
+          min-width: 280px;
+          z-index: 1000;
+          overflow: hidden;
+        }
+
+        .export-menu-header {
+          padding: 14px 16px;
+          background: #f9fafb;
+          border-bottom: 2px solid #e5e7eb;
+          font-weight: 700;
+          color: #1f2937;
+          font-size: 14px;
+        }
+
+        .export-option {
+          padding: 12px 16px;
+          cursor: pointer;
+          transition: all 0.2s;
+          display: flex;
+          align-items: center;
+          gap: 10px;
+          font-size: 14px;
+          color: #374151;
+          border-bottom: 1px solid #f3f4f6;
+        }
+
+        .export-option:last-child {
+          border-bottom: none;
+        }
+
+        .export-option:hover {
+          background: #fffbeb;
+          color: #F15843;
+          padding-left: 20px;
+        }
+
+        .export-option-icon {
+          font-size: 16px;
+        }
+
+        .export-option-text {
+          flex: 1;
+        }
+
+        .export-option-count {
+          font-size: 12px;
+          color: #9ca3af;
+          background: #f3f4f6;
+          padding: 2px 8px;
+          border-radius: 10px;
+        }
+
+        .selection-toolbar {
+          display: flex;
+          gap: 12px;
+          padding: 12px 16px;
+          background: #fffbeb;
+          border: 2px solid #fbbf24;
+          border-radius: 10px;
+          margin-top: 12px;
+          align-items: center;
+        }
+
+        .selection-count {
+          font-size: 14px;
+          font-weight: 600;
+          color: #92400e;
+        }
+
+        .selection-actions {
+          display: flex;
+          gap: 8px;
+          margin-left: auto;
+        }
+
+        .selection-btn {
+          padding: 6px 14px;
+          border: 1px solid #f59e0b;
+          background: white;
+          border-radius: 8px;
+          font-size: 13px;
+          font-weight: 600;
+          cursor: pointer;
+          transition: all 0.2s;
+          color: #92400e;
+        }
+
+        .selection-btn:hover {
+          background: #f59e0b;
+          color: white;
+        }
+
+        .checkbox-cell {
+          width: 40px;
+          text-align: center;
+        }
+
+        .session-checkbox {
+          width: 18px;
+          height: 18px;
+          cursor: pointer;
+          accent-color: #F15843;
         }
 
         .results-info {
@@ -1297,8 +1605,10 @@ const AnalyticsDashboard = () => {
         <div className="dashboard-header">
           <div className="header-content">
             <div className="dashboard-title">
-              <span>🛡️</span>
-              <span>Security Analytics Dashboard</span>
+            <div className="app-logo">
+              <img src={logo} alt="iNextLabs" />
+            </div>
+              <span>inFlow Shield</span>
             </div>
             <div className="dashboard-subtitle">
               Real-time monitoring of AI security guardrails and threat detection
@@ -1394,13 +1704,110 @@ const AnalyticsDashboard = () => {
                     </div>
 
                     <div className="action-buttons">
-                      <button className="icon-btn" onClick={exportToCSV}>📥 Export</button>
+                      <div style={{ position: 'relative' }}>
+                        <button className="icon-btn" onClick={() => setShowExportMenu(!showExportMenu)}>
+                          📥 Export {showExportMenu ? '▲' : '▼'}
+                        </button>
+                        {showExportMenu && (
+                          <div className="export-menu">
+                            <div className="export-menu-header">📊 Export Options</div>
+                            
+                            <div className="export-option" onClick={exportSummaryCSV}>
+                              <span className="export-option-icon">📄</span>
+                              <span className="export-option-text">Summary (CSV)</span>
+                              <span className="export-option-count">{sessions.length} sessions</span>
+                            </div>
+
+                            <div className="export-option" onClick={exportFullDataJSON}>
+                              <span className="export-option-icon">📦</span>
+                              <span className="export-option-text">Full Data + Prompts (JSON)</span>
+                              <span className="export-option-count">All details</span>
+                            </div>
+
+                            <div className="export-option" onClick={exportAllThreats}>
+                              <span className="export-option-icon">⚠️</span>
+                              <span className="export-option-text">All Threats (CSV)</span>
+                              <span className="export-option-count">
+                                {sessions.filter(s => s.pii_detections > 0 || s.jailbreak_attempts > 0 || s.toxicity_detections > 0 || s.blocked_prompts > 0).length} sessions
+                              </span>
+                            </div>
+
+                            <div className="export-option" onClick={exportPIIOnly}>
+                              <span className="export-option-icon">🔒</span>
+                              <span className="export-option-text">PII Only (CSV)</span>
+                              <span className="export-option-count">{sessions.filter(s => s.pii_detections > 0).length} sessions</span>
+                            </div>
+
+                            <div className="export-option" onClick={exportJailbreaksOnly}>
+                              <span className="export-option-icon">🚨</span>
+                              <span className="export-option-text">Jailbreaks Only (CSV)</span>
+                              <span className="export-option-count">{sessions.filter(s => s.jailbreak_attempts > 0).length} sessions</span>
+                            </div>
+
+                            <div className="export-option" onClick={exportToxicityOnly}>
+                              <span className="export-option-icon">☣️</span>
+                              <span className="export-option-text">Toxicity Only (CSV)</span>
+                              <span className="export-option-count">{sessions.filter(s => s.toxicity_detections > 0).length} sessions</span>
+                            </div>
+
+                            <div className="export-option" onClick={() => {
+                              setSelectionMode(true);
+                              setShowExportMenu(false);
+                            }}>
+                              <span className="export-option-icon">☑️</span>
+                              <span className="export-option-text">Select Sessions...</span>
+                              <span className="export-option-count">Custom</span>
+                            </div>
+
+                            {view === 'details' && selectedBot && (
+                              <div className="export-option" onClick={exportCurrentBot}>
+                                <span className="export-option-icon">🤖</span>
+                                <span className="export-option-text">Current Bot (JSON)</span>
+                                <span className="export-option-count">1 session</span>
+                              </div>
+                            )}
+                          </div>
+                        )}
+                      </div>
+
                       <button className="icon-btn" onClick={fetchAllSessions}>🔄 Refresh</button>
                       {sessions.length > 0 && (
                         <button className="icon-btn danger" onClick={clearAllSessions}>🗑️ Clear All</button>
                       )}
                     </div>
                   </div>
+
+                  {selectionMode && (
+                    <div className="selection-toolbar">
+                      <span className="selection-count">
+                        {selectedSessions.size} session{selectedSessions.size !== 1 ? 's' : ''} selected
+                      </span>
+                      <div className="selection-actions">
+                        <button className="selection-btn" onClick={selectAllSessions}>
+                          Select All ({filteredSessions.length})
+                        </button>
+                        <button className="selection-btn" onClick={deselectAllSessions}>
+                          Deselect All
+                        </button>
+                        <button 
+                          className="selection-btn" 
+                          onClick={exportSelectedSessions}
+                          disabled={selectedSessions.size === 0}
+                        >
+                          📥 Export Selected
+                        </button>
+                        <button 
+                          className="selection-btn" 
+                          onClick={() => {
+                            setSelectionMode(false);
+                            setSelectedSessions(new Set());
+                          }}
+                        >
+                          ✕ Cancel
+                        </button>
+                      </div>
+                    </div>
+                  )}
 
                   <div className="results-info">
                     <div>
@@ -1452,6 +1859,7 @@ const AnalyticsDashboard = () => {
                     <table className="sessions-table">
                       <thead>
                         <tr>
+                          {selectionMode && <th className="checkbox-cell">☑️</th>}
                           <th>Bot ID</th>
                           <th>Created</th>
                           <th>Prompts</th>
@@ -1460,21 +1868,33 @@ const AnalyticsDashboard = () => {
                       </thead>
                       <tbody>
                         {currentItems.map((session) => (
-                          <tr key={session.bot_id} onClick={() => fetchBotDetails(session.bot_id)}>
-                            <td><span className="bot-id">{session.bot_id.substring(0, 24)}...</span></td>
-                            <td>
+                          <tr key={session.bot_id}>
+                            {selectionMode && (
+                              <td className="checkbox-cell" onClick={(e) => e.stopPropagation()}>
+                                <input
+                                  type="checkbox"
+                                  className="session-checkbox"
+                                  checked={selectedSessions.has(session.bot_id)}
+                                  onChange={() => toggleSessionSelection(session.bot_id)}
+                                />
+                              </td>
+                            )}
+                            <td onClick={() => !selectionMode && fetchBotDetails(session.bot_id)}>
+                              <span className="bot-id">{session.bot_id.substring(0, 24)}...</span>
+                            </td>
+                            <td onClick={() => !selectionMode && fetchBotDetails(session.bot_id)}>
                               <div className="time-info">
                                 <div className="time-relative">{getRelativeTime(session.created_at)}</div>
                                 <div className="time-absolute">{formatDate(session.created_at)}</div>
                               </div>
                             </td>
-                            <td>
+                            <td onClick={() => !selectionMode && fetchBotDetails(session.bot_id)}>
                               <strong>{session.total_prompts}</strong>
                               {session.blocked_prompts > 0 && (
                                 <span style={{ color: '#ef4444', marginLeft: 8, fontSize: 13 }}>({session.blocked_prompts} blocked)</span>
                               )}
                             </td>
-                            <td>
+                            <td onClick={() => !selectionMode && fetchBotDetails(session.bot_id)}>
                               <div className="threat-badges">
                                 <ThreatBadge type="pii" count={session.pii_detections} />
                                 <ThreatBadge type="jailbreak" count={session.jailbreak_attempts} />
@@ -1587,7 +2007,10 @@ const AnalyticsDashboard = () => {
                 <div className="details-container">
                   <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20 }}>
                     <button className="back-btn" onClick={() => setView('overview')}>← Back to Overview</button>
-                    <button className="btn-delete-session" onClick={() => deleteBotSession(selectedBot)}>🗑️ Delete Session</button>
+                    <div style={{ display: 'flex', gap: 12 }}>
+                      <button className="icon-btn success" onClick={exportCurrentBot}>📥 Export This Bot</button>
+                      <button className="btn-delete-session" onClick={() => deleteBotSession(selectedBot)}>🗑️ Delete Session</button>
+                    </div>
                   </div>
 
                   <div className="section-title">🔍 Session Details: {selectedBot.substring(0, 30)}...</div>

@@ -21,7 +21,8 @@ ALLOWED_ORIGINS = [
     "http://0.0.0.0:8000",
     "http://localhost:3001",
     "http://127.0.0.1:3001",
-    "http://192.168.68.117:3001"
+    "http://192.168.68.111:3001",
+    "http://192.168.68.111:3000"
 ]
 
 # Scanner Configuration
