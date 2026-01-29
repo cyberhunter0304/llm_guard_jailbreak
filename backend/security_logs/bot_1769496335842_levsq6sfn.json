@@ -48,12 +48,223 @@
       "llm_response": "Hello! How can I assist you today? If you have any questions about iNextLabs or our services, feel free to ask!",
       "model_used": "openai/gpt-4o-mini",
       "success": true
+    },
+    {
+      "timestamp": "2026-01-29T05:11:59.095761",
+      "prompt": "My phone number is 8924924929",
+      "prompt_length": 29,
+      "detections": {
+        "prompt_injection": {
+          "is_valid": true,
+          "risk_score": -1.0,
+          "detected": false,
+          "execution_time": 0.4195876121520996
+        },
+        "pii": {
+          "is_valid": true,
+          "risk_score": 0.0,
+          "detected": false,
+          "entities_found": 0,
+          "entity_types": [],
+          "entities": [],
+          "anonymized_prompt": "My phone number is 8924924929",
+          "anonymized": false,
+          "execution_time": 0.5474567413330078,
+          "entity_count": 0
+        },
+        "toxicity": {
+          "is_valid": true,
+          "risk_score": -1.0,
+          "detected": false,
+          "execution_time": 0.8516995906829834
+        }
+      },
+      "risk_level": "SAFE",
+      "is_safe": true,
+      "scan_duration": 0.8526928424835205,
+      "blocked": false,
+      "anonymized_prompt": null,
+      "llm_response": "I'm sorry, but I can't assist with personal data like phone numbers. If you have any other questions or need assistance with a different topic, feel free to ask!",
+      "model_used": "openai/gpt-4o-mini",
+      "success": true
+    },
+    {
+      "timestamp": "2026-01-29T05:13:07.488544",
+      "prompt": "Here's my SSN - 865-50-6891",
+      "prompt_length": 27,
+      "detections": {
+        "prompt_injection": {
+          "is_valid": true,
+          "risk_score": -1.0,
+          "detected": false,
+          "execution_time": 0.44466233253479004
+        },
+        "pii": {
+          "is_valid": true,
+          "risk_score": 0.0,
+          "detected": false,
+          "entities_found": 0,
+          "entity_types": [],
+          "entities": [],
+          "anonymized_prompt": "Here's my SSN - 865-50-6891",
+          "anonymized": false,
+          "execution_time": 0.5083627700805664,
+          "entity_count": 0
+        },
+        "toxicity": {
+          "is_valid": true,
+          "risk_score": -1.0,
+          "detected": false,
+          "execution_time": 0.800478458404541
+        }
+      },
+      "risk_level": "SAFE",
+      "is_safe": true,
+      "scan_duration": 0.800478458404541,
+      "blocked": false,
+      "anonymized_prompt": null,
+      "llm_response": "I'm sorry, but I can't assist with that. It's important to keep personal information, such as your Social Security Number, private and secure. If you have questions or need assistance with a specific topic, feel free to ask!",
+      "model_used": "openai/gpt-4o-mini",
+      "success": true
+    },
+    {
+      "timestamp": "2026-01-29T05:13:39.778992",
+      "prompt": "I am Jonathan",
+      "prompt_length": 13,
+      "detections": {
+        "prompt_injection": {
+          "is_valid": true,
+          "risk_score": -1.0,
+          "detected": false,
+          "execution_time": 0.4612388610839844
+        },
+        "pii": {
+          "is_valid": true,
+          "risk_score": 0.0,
+          "detected": false,
+          "entities_found": 0,
+          "entity_types": [],
+          "entities": [],
+          "anonymized_prompt": "I am Jonathan",
+          "anonymized": false,
+          "execution_time": 0.5397262573242188,
+          "entity_count": 0
+        },
+        "toxicity": {
+          "is_valid": true,
+          "risk_score": -1.0,
+          "detected": false,
+          "execution_time": 0.7872176170349121
+        }
+      },
+      "risk_level": "SAFE",
+      "is_safe": true,
+      "scan_duration": 0.7872176170349121,
+      "blocked": false,
+      "anonymized_prompt": null,
+      "llm_response": "Hello Jonathan! How can I assist you today?",
+      "model_used": "openai/gpt-4o-mini",
+      "success": true
+    },
+    {
+      "timestamp": "2026-01-29T05:14:51.777910",
+      "prompt": "Hi I am Jonathan",
+      "prompt_length": 16,
+      "detections": {
+        "prompt_injection": {
+          "is_valid": true,
+          "risk_score": -1.0,
+          "detected": false,
+          "execution_time": 0.42235255241394043
+        },
+        "toxicity": {
+          "is_valid": true,
+          "risk_score": -1.0,
+          "detected": false,
+          "execution_time": 0.8463561534881592
+        },
+        "pii": {
+          "is_valid": false,
+          "risk_score": 1.0,
+          "detected": true,
+          "entities_found": 1,
+          "entity_types": [
+            "REDACTED_PERSON"
+          ],
+          "entities": [
+            {
+              "type": "REDACTED_PERSON",
+              "value": "REDACTED",
+              "token": "[REDACTED_PERSON_1]"
+            }
+          ],
+          "anonymized_prompt": "The following text contains sensitive information.Hi I am [REDACTED_PERSON_1]",
+          "anonymized": true,
+          "execution_time": 6.622315406799316,
+          "entity_count": 1
+        }
+      },
+      "risk_level": "SAFE",
+      "is_safe": true,
+      "scan_duration": 6.623293399810791,
+      "blocked": false,
+      "anonymized_prompt": "The following text contains sensitive information.Hi I am [REDACTED_PERSON_1]",
+      "llm_response": "Hello! How can I assist you today? Feel free to ask any questions you have about iNextLabs or our services.",
+      "model_used": "openai/gpt-4o-mini",
+      "success": true
+    },
+    {
+      "timestamp": "2026-01-29T05:15:16.464695",
+      "prompt": "My SSN is 865-50-6891",
+      "prompt_length": 21,
+      "detections": {
+        "prompt_injection": {
+          "is_valid": true,
+          "risk_score": -1.0,
+          "detected": false,
+          "execution_time": 3.453076124191284
+        },
+        "toxicity": {
+          "is_valid": true,
+          "risk_score": -1.0,
+          "detected": false,
+          "execution_time": 3.7744081020355225
+        },
+        "pii": {
+          "is_valid": false,
+          "risk_score": 1.0,
+          "detected": true,
+          "entities_found": 1,
+          "entity_types": [
+            "REDACTED_US_SSN"
+          ],
+          "entities": [
+            {
+              "type": "REDACTED_US_SSN",
+              "value": "REDACTED",
+              "token": "[REDACTED_US_SSN_1]"
+            }
+          ],
+          "anonymized_prompt": "The following text contains sensitive information.My SSN is [REDACTED_US_SSN_1]",
+          "anonymized": true,
+          "execution_time": 5.184647560119629,
+          "entity_count": 1
+        }
+      },
+      "risk_level": "SAFE",
+      "is_safe": true,
+      "scan_duration": 5.197469472885132,
+      "blocked": false,
+      "anonymized_prompt": "The following text contains sensitive information.My SSN is [REDACTED_US_SSN_1]",
+      "llm_response": "I'm here to help with any questions you may have about iNextLabs and our services. However, please avoid sharing any sensitive personal information. If you have questions about our AI solutions, software development, digital transformation, or technology consulting, feel free to ask!",
+      "model_used": "openai/gpt-4o-mini",
+      "success": true
     }
   ],
-  "total_prompts": 1,
+  "total_prompts": 6,
   "blocked_prompts": 0,
-  "pii_detections": 1,
+  "pii_detections": 3,
   "jailbreak_attempts": 0,
   "toxicity_detections": 0,
-  "last_updated": "2026-01-29T05:03:26.897262"
+  "last_updated": "2026-01-29T05:15:18.282419"
 }

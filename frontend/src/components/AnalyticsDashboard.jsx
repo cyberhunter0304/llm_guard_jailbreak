@@ -94,6 +94,10 @@ const AnalyticsDashboard = () => {
       );
     } else if (filterType === 'pii') {
       filtered = filtered.filter(session => session.pii_detections > 0);
+    } else if (filterType === 'jailbreak') {
+      filtered = filtered.filter(session => session.jailbreak_attempts > 0);
+    } else if (filterType === 'toxicity') {
+      filtered = filtered.filter(session => session.toxicity_detections > 0);
     }
 
     filtered.sort((a, b) => {
@@ -240,10 +244,10 @@ const AnalyticsDashboard = () => {
     ).length;
     
     return [
-      { name: 'PII Detected', value: stats.totalPII, color: '#f59e0b' },
-      { name: 'Jailbreak Attempts', value: stats.totalJailbreaks, color: '#ef4444' },
-      { name: 'Toxicity', value: stats.totalToxicity, color: '#dc2626' },
-      { name: 'Clean Sessions', value: cleanSessions, color: '#10b981' }
+      { name: 'PII Detected', value: stats.totalPII, color: '#f59e0b', filterType: 'pii' },
+      { name: 'Jailbreak Attempts', value: stats.totalJailbreaks, color: '#ef4444', filterType: 'jailbreak' },
+      { name: 'Toxicity', value: stats.totalToxicity, color: '#dc2626', filterType: 'toxicity' },
+      { name: 'Clean Sessions', value: cleanSessions, color: '#10b981', filterType: 'clean' }
     ].filter(item => item.value > 0);
   };
 
@@ -264,9 +268,9 @@ const AnalyticsDashboard = () => {
 
   const getThreatTypeData = () => {
     return [
-      { name: 'PII', count: stats.totalPII, color: '#f59e0b' },
-      { name: 'Jailbreak', count: stats.totalJailbreaks, color: '#ef4444' },
-      { name: 'Toxicity', count: stats.totalToxicity, color: '#dc2626' }
+      { name: 'PII', count: stats.totalPII, color: '#f59e0b', filterType: 'pii' },
+      { name: 'Jailbreak', count: stats.totalJailbreaks, color: '#ef4444', filterType: 'jailbreak' },
+      { name: 'Toxicity', count: stats.totalToxicity, color: '#dc2626', filterType: 'toxicity' }
     ].filter(item => item.count > 0);
   };
 
@@ -274,11 +278,35 @@ const AnalyticsDashboard = () => {
     return [...sessions]
       .map(s => ({
         id: s.bot_id.substring(0, 12) + '...',
+        fullId: s.bot_id,
         threats: (s.pii_detections || 0) + (s.jailbreak_attempts || 0) + (s.toxicity_detections || 0)
       }))
       .filter(s => s.threats > 0)
       .sort((a, b) => b.threats - a.threats)
       .slice(0, 10);
+  };
+
+  // NEW: Interactive Chart Handlers
+  const handlePieChartClick = (data) => {
+    if (data && data.filterType) {
+      setFilterType(data.filterType);
+      setView('overview');
+      setSearchTerm('');
+    }
+  };
+
+  const handleBarChartClick = (data) => {
+    if (data && data.fullId) {
+      fetchBotDetails(data.fullId);
+    }
+  };
+
+  const handleThreatTypeClick = (data) => {
+    if (data && data.filterType) {
+      setFilterType(data.filterType);
+      setView('overview');
+      setSearchTerm('');
+    }
   };
 
   // Pagination
@@ -319,6 +347,29 @@ const AnalyticsDashboard = () => {
         {labels[type]}: {count}
       </span>
     );
+  };
+
+  // Custom Tooltip for Charts
+  const CustomTooltip = ({ active, payload }) => {
+    if (active && payload && payload.length) {
+      return (
+        <div style={{
+          background: 'white',
+          padding: '12px',
+          border: '2px solid #e5e7eb',
+          borderRadius: '8px',
+          boxShadow: '0 4px 12px rgba(0,0,0,0.15)'
+        }}>
+          <p style={{ margin: 0, fontWeight: 600, color: '#1f2937' }}>
+            {payload[0].name}: {payload[0].value}
+          </p>
+          <p style={{ margin: '4px 0 0 0', fontSize: '12px', color: '#6b7280' }}>
+            Click to filter
+          </p>
+        </div>
+      );
+    }
+    return null;
   };
 
   return (
@@ -503,6 +554,25 @@ const AnalyticsDashboard = () => {
           padding: 24px;
           border-radius: 16px;
           box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+          position: relative;
+        }
+
+        .chart-container::after {
+          content: '👆 Click to interact';
+          position: absolute;
+          top: 24px;
+          right: 24px;
+          font-size: 11px;
+          color: #9ca3af;
+          background: #f9fafb;
+          padding: 4px 10px;
+          border-radius: 6px;
+          opacity: 0;
+          transition: opacity 0.3s;
+        }
+
+        .chart-container:hover::after {
+          opacity: 1;
         }
 
         .chart-title {
@@ -657,6 +727,35 @@ const AnalyticsDashboard = () => {
           display: flex;
           justify-content: space-between;
           align-items: center;
+        }
+
+        .filter-badge {
+          display: inline-flex;
+          align-items: center;
+          gap: 8px;
+          background: linear-gradient(135deg, #FF6B35 0%, #F7931E 100%);
+          color: white;
+          padding: 8px 16px;
+          border-radius: 20px;
+          font-size: 13px;
+          font-weight: 600;
+          margin-left: 12px;
+        }
+
+        .clear-filter-btn {
+          background: rgba(255, 255, 255, 0.2);
+          border: none;
+          color: white;
+          cursor: pointer;
+          padding: 2px 8px;
+          border-radius: 12px;
+          font-size: 12px;
+          font-weight: 700;
+          transition: all 0.2s;
+        }
+
+        .clear-filter-btn:hover {
+          background: rgba(255, 255, 255, 0.3);
         }
 
         .pagination {
@@ -1279,6 +1378,8 @@ const AnalyticsDashboard = () => {
                       <button className={`filter-btn ${filterType === 'all' ? 'active' : ''}`} onClick={() => setFilterType('all')}>All</button>
                       <button className={`filter-btn ${filterType === 'threats' ? 'active' : ''}`} onClick={() => setFilterType('threats')}>⚠️ Threats</button>
                       <button className={`filter-btn ${filterType === 'pii' ? 'active' : ''}`} onClick={() => setFilterType('pii')}>🔒 PII</button>
+                      <button className={`filter-btn ${filterType === 'jailbreak' ? 'active' : ''}`} onClick={() => setFilterType('jailbreak')}>🚨 Jailbreak</button>
+                      <button className={`filter-btn ${filterType === 'toxicity' ? 'active' : ''}`} onClick={() => setFilterType('toxicity')}>☣️ Toxicity</button>
                       <button className={`filter-btn ${filterType === 'clean' ? 'active' : ''}`} onClick={() => setFilterType('clean')}>✅ Clean</button>
                     </div>
 
@@ -1304,6 +1405,12 @@ const AnalyticsDashboard = () => {
                   <div className="results-info">
                     <div>
                       Showing {indexOfFirstItem + 1}-{Math.min(indexOfLastItem, filteredSessions.length)} of {filteredSessions.length} sessions
+                      {filterType !== 'all' && (
+                        <span className="filter-badge">
+                          Filtered by: {filterType.charAt(0).toUpperCase() + filterType.slice(1)}
+                          <button className="clear-filter-btn" onClick={() => setFilterType('all')}>✕</button>
+                        </span>
+                      )}
                     </div>
                     {totalPages > 1 && (
                       <div className="pagination">
@@ -1383,7 +1490,6 @@ const AnalyticsDashboard = () => {
               </>
             ) : view === 'analytics' ? (
               <>
-                {/* Analytics View - Charts and Visualizations */}
                 <div className="stats-grid">
                   <StatCard icon="💬" label="Total Sessions" value={stats.totalSessions} color="#3b82f6" />
                   <StatCard icon="📝" label="Total Prompts" value={stats.totalPrompts} color="#10b981" />
@@ -1406,12 +1512,14 @@ const AnalyticsDashboard = () => {
                           label={({ name, value }) => value > 0 ? `${name}: ${value}` : ''}
                           outerRadius={100}
                           dataKey="value"
+                          onClick={handlePieChartClick}
+                          cursor="pointer"
                         >
                           {getThreatDistributionData().map((entry, index) => (
                             <Cell key={`cell-${index}`} fill={entry.color} />
                           ))}
                         </Pie>
-                        <Tooltip />
+                        <Tooltip content={<CustomTooltip />} />
                         <Legend />
                       </PieChart>
                     </ResponsiveContainer>
@@ -1439,9 +1547,9 @@ const AnalyticsDashboard = () => {
                         <CartesianGrid strokeDasharray="3 3" />
                         <XAxis dataKey="name" />
                         <YAxis />
-                        <Tooltip />
+                        <Tooltip content={<CustomTooltip />} />
                         <Legend />
-                        <Bar dataKey="count" name="Detections">
+                        <Bar dataKey="count" name="Detections" onClick={handleThreatTypeClick} cursor="pointer">
                           {getThreatTypeData().map((entry, index) => (
                             <Cell key={`cell-${index}`} fill={entry.color} />
                           ))}
@@ -1457,14 +1565,13 @@ const AnalyticsDashboard = () => {
                         <CartesianGrid strokeDasharray="3 3" />
                         <XAxis type="number" />
                         <YAxis dataKey="id" type="category" width={100} tick={{ fontSize: 11 }} />
-                        <Tooltip />
-                        <Bar dataKey="threats" fill="#ef4444" name="Total Threats" />
+                        <Tooltip content={<CustomTooltip />} />
+                        <Bar dataKey="threats" fill="#ef4444" name="Total Threats" onClick={handleBarChartClick} cursor="pointer" />
                       </BarChart>
                     </ResponsiveContainer>
                   </div>
                 </div>
 
-                {/* Additional Analytics Info */}
                 <div className="sessions-container">
                   <div className="section-title">📊 Analytics Summary</div>
                   <div style={{ padding: '20px', color: '#6b7280', lineHeight: '1.8' }}>
