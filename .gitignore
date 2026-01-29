@@ -82,6 +82,7 @@ logs
 # Testing
 coverage/
 .nyc_output/
+security_logs/
 
 # Misc
 .cache/

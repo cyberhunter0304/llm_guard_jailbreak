@@ -1,51 +1,23 @@
 {
   "bot_id": "bot_1769496335842_levsq6sfn",
-  "created_at": "2026-01-28T09:27:12.712492",
+  "created_at": "2026-01-29T05:02:39.830350",
   "security_events": [
     {
-      "timestamp": "2026-01-28T09:27:22.869701",
-      "prompt": "Hi",
-      "prompt_length": 2,
-      "detections": {
-        "prompt_injection": {
-          "is_valid": true,
-          "risk_score": -1.0,
-          "detected": false
-        },
-        "toxicity": {
-          "is_valid": true,
-          "risk_score": -1.0,
-          "detected": false
-        },
-        "pii": {
-          "detected": false,
-          "risk_score": 0.0
-        }
-      },
-      "risk_level": "SAFE",
-      "is_safe": true,
-      "blocked": false,
-      "anonymized_prompt": null,
-      "llm_response": "Hello! How can I assist you today?",
-      "model_used": "openai/gpt-4o-mini",
-      "success": true
-    },
-    {
-      "timestamp": "2026-01-28T10:03:21.506532",
-      "prompt": "Hi I am Nish",
-      "prompt_length": 12,
+      "timestamp": "2026-01-29T05:03:25.349372",
+      "prompt": "My name is Mamlesh",
+      "prompt_length": 18,
       "detections": {
         "prompt_injection": {
           "is_valid": true,
           "risk_score": -1.0,
           "detected": false,
-          "execution_time": 0.4860076904296875
+          "execution_time": 1.1470108032226562
         },
         "toxicity": {
           "is_valid": true,
           "risk_score": -1.0,
           "detected": false,
-          "execution_time": 2.6759519577026367
+          "execution_time": 1.8540990352630615
         },
         "pii": {
           "is_valid": false,
@@ -62,25 +34,26 @@
               "token": "[REDACTED_PERSON_1]"
             }
           ],
-          "anonymized_prompt": "The following text contains sensitive information.Hi I am [REDACTED_PERSON_1]",
+          "anonymized_prompt": "The following text contains sensitive information.My name is [REDACTED_PERSON_1]",
           "anonymized": true,
-          "execution_time": 7.296902418136597
+          "execution_time": 45.50399088859558,
+          "entity_count": 1
         }
       },
       "risk_level": "SAFE",
       "is_safe": true,
-      "scan_duration": 7.992071628570557,
+      "scan_duration": 45.510416984558105,
       "blocked": false,
-      "anonymized_prompt": "The following text contains sensitive information.Hi I am [REDACTED_PERSON_1]",
-      "llm_response": "Hello! How can I assist you today? If you have any questions about iNextLabs, our services, or anything related to AI and technology, feel free to ask!",
+      "anonymized_prompt": "The following text contains sensitive information.My name is [REDACTED_PERSON_1]",
+      "llm_response": "Hello! How can I assist you today? If you have any questions about iNextLabs or our services, feel free to ask!",
       "model_used": "openai/gpt-4o-mini",
       "success": true
     }
   ],
-  "total_prompts": 2,
+  "total_prompts": 1,
   "blocked_prompts": 0,
   "pii_detections": 1,
   "jailbreak_attempts": 0,
   "toxicity_detections": 0,
-  "last_updated": "2026-01-28T10:03:23.038300"
+  "last_updated": "2026-01-29T05:03:26.897262"
 }
