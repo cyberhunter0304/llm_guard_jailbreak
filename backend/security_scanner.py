@@ -83,6 +83,8 @@ logger = logging.getLogger(__name__)
 prompt_injection_scanner = PromptInjection(threshold=SCANNER_CONFIG["prompt_injection_threshold"])
 toxicity_scanner = Toxicity(threshold=SCANNER_CONFIG["toxicity_threshold"])
 
+# Note: PII, Secrets, and Sensitive scanners are now managed in pii_detector.py
+
 # 🔧 ADD MORE SCANNERS HERE:
 # Example scanners you can add from llm_guard.input_scanners:
 # - BanSubstrings: Block specific words/phrases
@@ -91,14 +93,12 @@ toxicity_scanner = Toxicity(threshold=SCANNER_CONFIG["toxicity_threshold"])
 # - Language: Detect language mismatches
 # - PromptInjectionV2: Alternative prompt injection detector
 # - Regex: Custom regex pattern matching
-# - Secrets: Detect API keys, passwords, tokens
 # - Sentiment: Detect sentiment (positive/negative)
 # - TokenLimit: Limit token count
 # 
 # Example:
-# from llm_guard.input_scanners import BanTopics, Secrets
+# from llm_guard.input_scanners import BanTopics
 # ban_topics_scanner = BanTopics(topics=["violence", "hate"], threshold=0.7)
-# secrets_scanner = Secrets(redact_mode="all")
 # ============================================================================
 
 # Increased thread pool for handling many concurrent requests
@@ -123,10 +123,10 @@ class ConcurrentSecurityScanner:
             "toxicity": toxicity_scanner
             # 🔧 ADD NEW SCANNERS HERE:
             # "ban_topics": ban_topics_scanner,
-            # "secrets": secrets_scanner,
             # "code_detection": code_scanner,
             # "sentiment": sentiment_scanner,
         }
+        # Note: PII/Secrets/Sensitive handled separately in _run_pii_scanner
         # ====================================================================
     
     def _run_single_scanner(self, scanner_name: str, scanner, prompt: str) -> Tuple[str, Dict[str, Any]]:
@@ -158,13 +158,17 @@ class ConcurrentSecurityScanner:
             }
     
     def _run_pii_scanner(self, prompt: str) -> Tuple[str, Dict[str, Any]]:
-        """Execute PII scanner with isolated instance"""
+        """Execute PII scanner with isolated instance - includes Secrets detection"""
         start_time = time.time()
         
         try:
-            # Each call gets its own detector instance
-            anonymized_prompt, pii_entities = ThreadSafePIIDetector.anonymize(prompt)
+            # Run all PII-related scanners (PII, Secrets)
+            anonymized_prompt, pii_entities, scanner_results = ThreadSafePIIDetector.anonymize(prompt)
+            
             execution_time = time.time() - start_time
+            
+            # Extract scanner results
+            secrets_result = scanner_results.get("secrets", {})
             
             result = {
                 "is_valid": len(pii_entities) == 0,
@@ -176,7 +180,10 @@ class ConcurrentSecurityScanner:
                 "anonymized_prompt": anonymized_prompt,
                 "anonymized": len(pii_entities) > 0,
                 "execution_time": execution_time,
-                "entity_count": len(pii_entities)
+                "entity_count": len(pii_entities),
+                # Include secrets results
+                "secrets_detected": secrets_result.get("detected", False),
+                "secrets_risk_score": secrets_result.get("risk_score", 0.0)
             }
             
             logger.debug(f"PII scanner completed in {execution_time:.3f}s")
@@ -191,7 +198,9 @@ class ConcurrentSecurityScanner:
                 "risk_score": 0.0,
                 "detected": False,
                 "anonymized_prompt": prompt,
-                "execution_time": execution_time
+                "execution_time": execution_time,
+                "secrets_detected": False,
+                "secrets_risk_score": 0.0
             }
     
     def scan_prompt_parallel(self, prompt: str, bot_id: str = "unknown") -> SecurityScanResult:
@@ -209,7 +218,12 @@ class ConcurrentSecurityScanner:
             "risk_level": "SAFE",
             "message": "Prompt passed all security checks",
             "timestamp": now(),
-            "scan_duration": 0.0
+            "scan_duration": 0.0,
+            "metrics": {
+                "total_scan_time": 0.0,
+                "scanner_times": {},
+                "scanner_count": 0
+            }
         }
         
         # Submit ALL scanners to thread pool
@@ -234,7 +248,7 @@ class ConcurrentSecurityScanner:
         # futures[custom_future] = "custom_scanner_name"
         # ====================================================================
         
-        # Wait for ALL scanners to complete
+        # Wait for ALL scanners to complete and collect results
         max_risk_score = 0.0
         detected_threats = []
         anonymized_prompt = prompt
@@ -243,21 +257,50 @@ class ConcurrentSecurityScanner:
             scanner_name, detection_result = future.result()
             results["detections"][scanner_name] = detection_result
             
+            # Collect timing metrics
+            if "execution_time" in detection_result:
+                results["metrics"]["scanner_times"][scanner_name] = round(detection_result["execution_time"], 4)
+            
             # Track anonymized prompt
             if scanner_name == "pii" and detection_result.get("anonymized_prompt"):
                 anonymized_prompt = detection_result["anonymized_prompt"]
-            
-            # Check for threats (excluding PII which is just anonymized)
-            if not detection_result.get("is_valid", True) and scanner_name != "pii":
-                results["is_safe"] = False
-                detected_threats.append(scanner_name.replace("_", " ").title())
-                max_risk_score = max(max_risk_score, detection_result.get("risk_score", 0.0))
+        
+        # Update scanner count
+        results["metrics"]["scanner_count"] = len(futures)
+        
+        # ====================================================================
+        # THREAT DETECTION - Priority Order (Most Specific → Most General)
+        # ====================================================================
+        # Check in this order to ensure correct error messages:
+        # 1. Secrets (API keys, passwords) - HIGHEST PRIORITY
+        # 2. Prompt Injection
+        # 3. Toxicity
+        # ====================================================================
+        
+        # PRIORITY 1: Check for secrets detection (API keys, passwords, tokens)
+        pii_results = results["detections"].get("pii", {})
+        if pii_results.get("secrets_detected", False):
+            results["is_safe"] = False
+            detected_threats.append("Secrets")
+            max_risk_score = max(max_risk_score, pii_results.get("secrets_risk_score", 0.0))
+        
+        # PRIORITY 2 & 3: Check other scanners (only if no secrets found)
+        # This prevents prompt injection from overriding the secrets message
+        if not detected_threats:  # Only check if no high-priority threats found
+            for scanner_name, detection_result in results["detections"].items():
+                # Skip PII scanner (already handled above)
+                if scanner_name == "pii":
+                    continue
+                
+                # Check for threats from other scanners
+                if not detection_result.get("is_valid", True):
+                    results["is_safe"] = False
+                    detected_threats.append(scanner_name.replace("_", " ").title())
+                    max_risk_score = max(max_risk_score, detection_result.get("risk_score", 0.0))
             
             # 🔧 CUSTOM THREAT HANDLING FOR NEW SCANNERS:
             # Add special handling for specific scanners here if needed
             # Example: Different actions for different scanner types
-            # if scanner_name == "secrets" and detection_result.get("detected"):
-            #     results["contains_secrets"] = True
             # if scanner_name == "ban_topics" and detection_result.get("detected"):
             #     results["banned_topic_found"] = True
             # ====================================================================
@@ -265,6 +308,7 @@ class ConcurrentSecurityScanner:
         # Calculate total scan duration
         scan_duration = time.time() - scan_start_time
         results["scan_duration"] = scan_duration
+        results["metrics"]["total_scan_time"] = round(scan_duration, 4)
         
         # Determine risk level and messages
         if not results["is_safe"]:
@@ -277,11 +321,11 @@ class ConcurrentSecurityScanner:
             
             friendly_messages = {
                 "Prompt Injection": "I'm sorry, but I cannot process this request. Please rephrase your question in a different way.",
-                "Toxicity": "Please ask your question respectfully. I'm here to help when you communicate in a kind manner."
+                "Toxicity": "Please ask your question respectfully. I'm here to help when you communicate in a kind manner.",
+                "Secrets": "Your message contains sensitive credentials like API keys or passwords. Please remove them before continuing."
                 # 🔧 ADD FRIENDLY MESSAGES FOR NEW SCANNERS:
                 # These messages are shown to users when their prompt is blocked
                 # "Ban Topics": "This topic is not allowed. Please ask about something else.",
-                # "Secrets": "Your message contains sensitive information. Please remove any passwords or API keys.",
                 # "Code Detection": "Code execution is not allowed in prompts. Please rephrase your question.",
                 # "Sentiment": "Your message seems concerning. Please reach out if you need support.",
                 # ====================================================================

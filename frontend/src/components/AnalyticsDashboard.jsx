@@ -8,10 +8,10 @@ const AnalyticsDashboard = () => {
   const [selectedBot, setSelectedBot] = useState(null);
   const [botDetails, setBotDetails] = useState(null);
   const [loading, setLoading] = useState(true);
-  const [view, setView] = useState('overview'); // 'overview', 'analytics', or 'details'
+  const [view, setView] = useState('overview');
   const [detailsTab, setDetailsTab] = useState('events');
   const [searchTerm, setSearchTerm] = useState('');
-  const [searchMode, setSearchMode] = useState('botId'); // 'botId' or 'prompt'
+  const [searchMode, setSearchMode] = useState('botId');
   const [filterType, setFilterType] = useState('all');
   const [sortBy, setSortBy] = useState('date-desc');
   const [currentPage, setCurrentPage] = useState(1);
@@ -26,7 +26,8 @@ const AnalyticsDashboard = () => {
     totalBlocked: 0,
     totalPII: 0,
     totalJailbreaks: 0,
-    totalToxicity: 0
+    totalToxicity: 0,
+    totalSecrets: 0
   });
 
   const BACKEND_URL = `http://${window.location.hostname}:8000`;
@@ -57,20 +58,20 @@ const AnalyticsDashboard = () => {
         totalBlocked: acc.totalBlocked + (session.blocked_prompts || 0),
         totalPII: acc.totalPII + (session.pii_detections || 0),
         totalJailbreaks: acc.totalJailbreaks + (session.jailbreak_attempts || 0),
-        totalToxicity: acc.totalToxicity + (session.toxicity_detections || 0)
+        totalToxicity: acc.totalToxicity + (session.toxicity_detections || 0),
+        totalSecrets: acc.totalSecrets + (session.secrets_detections || 0)
       }), {
         totalSessions: 0,
         totalPrompts: 0,
         totalBlocked: 0,
         totalPII: 0,
         totalJailbreaks: 0,
-        totalToxicity: 0
+        totalToxicity: 0,
+        totalSecrets: 0
       });
       
       setStats(totalStats);
       setLoading(false);
-      
-      // Note: fetchAllSessionDetails will be called by useEffect when sessions update
     } catch (error) {
       console.error('Failed to fetch sessions:', error);
       setLoading(false);
@@ -86,12 +87,10 @@ const AnalyticsDashboard = () => {
           session.bot_id.toLowerCase().includes(searchTerm.toLowerCase())
         );
       } else if (searchMode === 'prompt') {
-        // For prompt search, we need to check if any session has matching prompts
         const matchingBotIds = new Set(promptSearchResults.map(result => result.bot_id));
         if (matchingBotIds.size > 0) {
           filtered = filtered.filter(session => matchingBotIds.has(session.bot_id));
         } else if (searchTerm.length >= 3) {
-          // If search term is long enough but no results yet, show empty
           filtered = [];
         }
       }
@@ -102,6 +101,7 @@ const AnalyticsDashboard = () => {
         session.pii_detections > 0 || 
         session.jailbreak_attempts > 0 || 
         session.toxicity_detections > 0 ||
+        session.secrets_detections > 0 ||
         session.blocked_prompts > 0
       );
     } else if (filterType === 'clean') {
@@ -109,6 +109,7 @@ const AnalyticsDashboard = () => {
         session.pii_detections === 0 && 
         session.jailbreak_attempts === 0 && 
         session.toxicity_detections === 0 &&
+        session.secrets_detections === 0 &&
         session.blocked_prompts === 0
       );
     } else if (filterType === 'pii') {
@@ -117,6 +118,8 @@ const AnalyticsDashboard = () => {
       filtered = filtered.filter(session => session.jailbreak_attempts > 0);
     } else if (filterType === 'toxicity') {
       filtered = filtered.filter(session => session.toxicity_detections > 0);
+    } else if (filterType === 'secrets') {
+      filtered = filtered.filter(session => session.secrets_detections > 0);
     }
 
     filtered.sort((a, b) => {
@@ -126,8 +129,8 @@ const AnalyticsDashboard = () => {
         case 'date-asc':
           return new Date(a.created_at) - new Date(b.created_at);
         case 'threats-desc':
-          const threatsA = (a.pii_detections || 0) + (a.jailbreak_attempts || 0) + (a.toxicity_detections || 0);
-          const threatsB = (b.pii_detections || 0) + (b.jailbreak_attempts || 0) + (b.toxicity_detections || 0);
+          const threatsA = (a.pii_detections || 0) + (a.jailbreak_attempts || 0) + (a.toxicity_detections || 0) + (a.secrets_detections || 0);
+          const threatsB = (b.pii_detections || 0) + (b.jailbreak_attempts || 0) + (b.toxicity_detections || 0) + (b.secrets_detections || 0);
           return threatsB - threatsA;
         case 'prompts-desc':
           return (b.total_prompts || 0) - (a.total_prompts || 0);
@@ -221,9 +224,9 @@ const AnalyticsDashboard = () => {
           piiData.push({
             eventIndex: eventIndex + 1,
             timestamp: event.timestamp,
-            type: entity.entity_type || 'Unknown',
-            value: entity.text || 'N/A',
-            confidence: entity.score || 0,
+            type: entity.type || 'Unknown',
+            value: entity.value || 'N/A',
+            confidence: 0,
             prompt: event.prompt
           });
         });
@@ -233,7 +236,6 @@ const AnalyticsDashboard = () => {
     return piiData;
   };
 
-  // Fetch all session details on mount for instant prompt search
   const [allSessionDetails, setAllSessionDetails] = useState({});
   const [loadingPromptData, setLoadingPromptData] = useState(false);
 
@@ -257,7 +259,6 @@ const AnalyticsDashboard = () => {
     setLoadingPromptData(false);
   };
 
-  // Load all session details when sessions change
   useEffect(() => {
     if (sessions.length > 0) {
       fetchAllSessionDetails();
@@ -273,7 +274,6 @@ const AnalyticsDashboard = () => {
     const lowerQuery = searchQuery.toLowerCase();
     const results = [];
 
-    // Search through cached session details
     Object.entries(allSessionDetails).forEach(([botId, details]) => {
       if (details.security_events) {
         const matchingEvents = details.security_events.filter(event => 
@@ -298,7 +298,6 @@ const AnalyticsDashboard = () => {
     setPromptSearchResults(results);
   };
 
-  // Instant search - no debounce
   useEffect(() => {
     if (searchMode === 'prompt') {
       searchPrompts(searchTerm);
@@ -307,7 +306,6 @@ const AnalyticsDashboard = () => {
     }
   }, [searchTerm, searchMode, allSessionDetails]);
 
-  // Enhanced Export Functions
   const downloadCSV = (data, filename) => {
     const blob = new Blob([data], { type: 'text/csv;charset=utf-8;' });
     const url = window.URL.createObjectURL(blob);
@@ -325,6 +323,7 @@ const AnalyticsDashboard = () => {
       'Total Prompts': session.total_prompts,
       'Blocked': session.blocked_prompts,
       'PII': session.pii_detections,
+      'Secrets': session.secrets_detections || 0,
       'Jailbreaks': session.jailbreak_attempts,
       'Toxicity': session.toxicity_detections
     }));
@@ -413,9 +412,28 @@ const AnalyticsDashboard = () => {
     setShowExportMenu(false);
   };
 
+  // Export function for Secrets
+  const exportSecretsOnly = () => {
+    const secretsSessions = sessions.filter(s => s.secrets_detections > 0);
+    const csvData = secretsSessions.map(session => ({
+      'Bot ID': session.bot_id,
+      'Created': formatDate(session.created_at),
+      'Secrets Detections': session.secrets_detections,
+      'Total Prompts': session.total_prompts
+    }));
+
+    const headers = Object.keys(csvData[0] || {}).join(',');
+    const rows = csvData.map(row => Object.values(row).map(val => `"${val}"`).join(',')).join('\n');
+    const csv = `${headers}\n${rows}`;
+    
+    downloadCSV(csv, `secrets-detections-${new Date().toISOString().split('T')[0]}.csv`);
+    setShowExportMenu(false);
+  };
+
   const exportAllThreats = () => {
     const threatSessions = sessions.filter(s => 
-      s.pii_detections > 0 || s.jailbreak_attempts > 0 || s.toxicity_detections > 0 || s.blocked_prompts > 0
+      s.pii_detections > 0 || s.jailbreak_attempts > 0 || s.toxicity_detections > 0 || 
+      s.secrets_detections > 0 || s.blocked_prompts > 0
     );
     const csvData = threatSessions.map(session => ({
       'Bot ID': session.bot_id,
@@ -423,9 +441,10 @@ const AnalyticsDashboard = () => {
       'Total Prompts': session.total_prompts,
       'Blocked': session.blocked_prompts,
       'PII': session.pii_detections,
+      'Secrets': session.secrets_detections || 0,
       'Jailbreaks': session.jailbreak_attempts,
       'Toxicity': session.toxicity_detections,
-      'Total Threats': (session.pii_detections + session.jailbreak_attempts + session.toxicity_detections + session.blocked_prompts)
+      'Total Threats': (session.pii_detections + session.secrets_detections + session.jailbreak_attempts + session.toxicity_detections + session.blocked_prompts)
     }));
 
     const headers = Object.keys(csvData[0] || {}).join(',');
@@ -505,14 +524,15 @@ const AnalyticsDashboard = () => {
     setSelectedSessions(new Set());
   };
 
-  // Chart data preparation
   const getThreatDistributionData = () => {
     const cleanSessions = sessions.filter(s => 
-      s.pii_detections === 0 && s.jailbreak_attempts === 0 && s.toxicity_detections === 0
+      s.pii_detections === 0 && s.jailbreak_attempts === 0 && s.toxicity_detections === 0 &&
+      s.secrets_detections === 0
     ).length;
     
     return [
       { name: 'PII Detected', value: stats.totalPII, color: '#f59e0b', filterType: 'pii' },
+      { name: 'Secrets Detected', value: stats.totalSecrets, color: '#8b5cf6', filterType: 'secrets' },
       { name: 'Jailbreak Attempts', value: stats.totalJailbreaks, color: '#ef4444', filterType: 'jailbreak' },
       { name: 'Toxicity', value: stats.totalToxicity, color: '#dc2626', filterType: 'toxicity' },
       { name: 'Clean Sessions', value: cleanSessions, color: '#10b981', filterType: 'clean' }
@@ -521,13 +541,15 @@ const AnalyticsDashboard = () => {
 
   const getTimelineData = () => {
     const grouped = sessions.reduce((acc, session) => {
-      const date = new Date(session.created_at).toLocaleDateString();
+      const dateObj = new Date(session.created_at);
+      // Format as "Jan 29" for cleaner display
+      const date = dateObj.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
       if (!acc[date]) {
         acc[date] = { date, sessions: 0, threats: 0, prompts: 0 };
       }
       acc[date].sessions += 1;
       acc[date].prompts += session.total_prompts || 0;
-      acc[date].threats += (session.pii_detections || 0) + (session.jailbreak_attempts || 0) + (session.toxicity_detections || 0);
+      acc[date].threats += (session.pii_detections || 0) + (session.secrets_detections || 0) + (session.jailbreak_attempts || 0) + (session.toxicity_detections || 0);
       return acc;
     }, {});
 
@@ -537,6 +559,7 @@ const AnalyticsDashboard = () => {
   const getThreatTypeData = () => {
     return [
       { name: 'PII', count: stats.totalPII, color: '#f59e0b', filterType: 'pii' },
+      { name: 'Secrets', count: stats.totalSecrets, color: '#8b5cf6', filterType: 'secrets' },
       { name: 'Jailbreak', count: stats.totalJailbreaks, color: '#ef4444', filterType: 'jailbreak' },
       { name: 'Toxicity', count: stats.totalToxicity, color: '#dc2626', filterType: 'toxicity' }
     ].filter(item => item.count > 0);
@@ -547,14 +570,13 @@ const AnalyticsDashboard = () => {
       .map(s => ({
         id: s.bot_id.substring(0, 12) + '...',
         fullId: s.bot_id,
-        threats: (s.pii_detections || 0) + (s.jailbreak_attempts || 0) + (s.toxicity_detections || 0)
+        threats: (s.pii_detections || 0) + (s.secrets_detections || 0) + (s.jailbreak_attempts || 0) + (s.toxicity_detections || 0)
       }))
       .filter(s => s.threats > 0)
       .sort((a, b) => b.threats - a.threats)
       .slice(0, 10);
   };
 
-  // NEW: Interactive Chart Handlers
   const handlePieChartClick = (data) => {
     if (data && data.filterType) {
       setFilterType(data.filterType);
@@ -577,7 +599,6 @@ const AnalyticsDashboard = () => {
     }
   };
 
-  // Pagination
   const indexOfLastItem = currentPage * itemsPerPage;
   const indexOfFirstItem = indexOfLastItem - itemsPerPage;
   const currentItems = filteredSessions.slice(indexOfFirstItem, indexOfLastItem);
@@ -598,12 +619,14 @@ const AnalyticsDashboard = () => {
   const ThreatBadge = ({ type, count }) => {
     const colors = {
       pii: '#f59e0b',
+      secrets: '#8b5cf6',
       jailbreak: '#ef4444',
       toxicity: '#dc2626'
     };
     
     const labels = {
       pii: 'PII',
+      secrets: 'SEC',
       jailbreak: 'JB',
       toxicity: 'TOX'
     };
@@ -617,7 +640,6 @@ const AnalyticsDashboard = () => {
     );
   };
 
-  // Custom Tooltip for Charts
   const CustomTooltip = ({ active, payload }) => {
     if (active && payload && payload.length) {
       return (
@@ -642,6 +664,7 @@ const AnalyticsDashboard = () => {
 
   return (
     <>
+      {/* CSS styles remain the same - just using the existing styles from the original file */}
       <style>{`
         * {
           margin: 0;
@@ -1560,9 +1583,76 @@ const AnalyticsDashboard = () => {
           color: #92400e;
         }
 
+        .detection-tag.secrets {
+          background: #ede9fe;
+          color: #5b21b6;
+        }
+
+        
+
         .detection-tag.safe {
           background: #d1fae5;
           color: #065f46;
+        }
+
+        .metrics-grid {
+          display: grid;
+          grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+          gap: 12px;
+          background: white;
+          padding: 12px;
+          border-radius: 8px;
+          border: 1px solid #e5e7eb;
+        }
+
+        .metric-item {
+          display: flex;
+          justify-content: space-between;
+          align-items: center;
+          padding: 8px 12px;
+          background: #f9fafb;
+          border-radius: 6px;
+        }
+
+        .metric-label {
+          font-size: 13px;
+          font-weight: 600;
+          color: #6b7280;
+        }
+
+        .metric-value {
+          font-size: 15px;
+          font-weight: 700;
+          color: #059669;
+          font-family: 'SF Mono', 'Monaco', 'Consolas', monospace;
+        }
+
+        .scanner-metrics {
+          display: grid;
+          grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+          gap: 8px;
+        }
+
+        .scanner-metric-item {
+          display: flex;
+          justify-content: space-between;
+          align-items: center;
+          padding: 6px 10px;
+          background: #f3f4f6;
+          border-radius: 6px;
+          font-size: 12px;
+        }
+
+        .scanner-name {
+          font-weight: 600;
+          color: #374151;
+          font-size: 11px;
+        }
+
+        .scanner-time {
+          font-weight: 700;
+          color: #6366f1;
+          font-family: 'SF Mono', 'Monaco', 'Consolas', monospace;
         }
 
         .pii-table {
@@ -1682,7 +1772,6 @@ const AnalyticsDashboard = () => {
           color: #374151;
         }
 
-        /* Insights Dashboard Styles */
         .insights-grid {
           display: grid;
           grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
@@ -1774,7 +1863,6 @@ const AnalyticsDashboard = () => {
           margin-top: 12px;
         }
 
-        /* Threat Breakdown Section */
         .threat-breakdown-section {
           margin-top: 32px;
           padding: 24px;
@@ -1849,7 +1937,6 @@ const AnalyticsDashboard = () => {
           margin-top: 4px;
         }
 
-        /* Security Health Score Section */
         .security-health-section {
           margin-top: 32px;
           padding: 32px;
@@ -1986,9 +2073,9 @@ const AnalyticsDashboard = () => {
         <div className="dashboard-header">
           <div className="header-content">
             <div className="dashboard-title">
-            <div className="app-logo">
-              <img src={logo} alt="iNextLabs" />
-            </div>
+              <div className="app-logo">
+                <img src={logo} alt="iNextLabs" />
+              </div>
               <span>inFlow Shield</span>
             </div>
             <div className="dashboard-subtitle">
@@ -2059,6 +2146,7 @@ const AnalyticsDashboard = () => {
                   <StatCard icon="📝" label="Total Prompts" value={stats.totalPrompts} color="#10b981" />
                   <StatCard icon="🚫" label="Blocked Prompts" value={stats.totalBlocked} color="#ef4444" />
                   <StatCard icon="🔒" label="PII Detections" value={stats.totalPII} color="#f59e0b" />
+                  <StatCard icon="🔑" label="Secrets Detected" value={stats.totalSecrets} color="#8b5cf6" />
                   <StatCard icon="⚠️" label="Jailbreak Attempts" value={stats.totalJailbreaks} color="#dc2626" />
                   <StatCard icon="☣️" label="Toxicity Detected" value={stats.totalToxicity} color="#991b1b" />
                 </div>
@@ -2090,6 +2178,7 @@ const AnalyticsDashboard = () => {
                       <button className={`filter-btn ${filterType === 'all' ? 'active' : ''}`} onClick={() => setFilterType('all')}>All</button>
                       <button className={`filter-btn ${filterType === 'threats' ? 'active' : ''}`} onClick={() => setFilterType('threats')}>⚠️ Threats</button>
                       <button className={`filter-btn ${filterType === 'pii' ? 'active' : ''}`} onClick={() => setFilterType('pii')}>🔒 PII</button>
+                      <button className={`filter-btn ${filterType === 'secrets' ? 'active' : ''}`} onClick={() => setFilterType('secrets')}>🔑 Secrets</button>
                       <button className={`filter-btn ${filterType === 'jailbreak' ? 'active' : ''}`} onClick={() => setFilterType('jailbreak')}>🚨 Jailbreak</button>
                       <button className={`filter-btn ${filterType === 'toxicity' ? 'active' : ''}`} onClick={() => setFilterType('toxicity')}>☣️ Toxicity</button>
                       <button className={`filter-btn ${filterType === 'clean' ? 'active' : ''}`} onClick={() => setFilterType('clean')}>✅ Clean</button>
@@ -2130,7 +2219,7 @@ const AnalyticsDashboard = () => {
                               <span className="export-option-icon">⚠️</span>
                               <span className="export-option-text">All Threats (CSV)</span>
                               <span className="export-option-count">
-                                {sessions.filter(s => s.pii_detections > 0 || s.jailbreak_attempts > 0 || s.toxicity_detections > 0 || s.blocked_prompts > 0).length} sessions
+                                {sessions.filter(s => s.pii_detections > 0 || s.secrets_detections > 0 || s.jailbreak_attempts > 0 || s.toxicity_detections > 0 || s.blocked_prompts > 0).length} sessions
                               </span>
                             </div>
 
@@ -2138,6 +2227,12 @@ const AnalyticsDashboard = () => {
                               <span className="export-option-icon">🔒</span>
                               <span className="export-option-text">PII Only (CSV)</span>
                               <span className="export-option-count">{sessions.filter(s => s.pii_detections > 0).length} sessions</span>
+                            </div>
+
+                            <div className="export-option" onClick={exportSecretsOnly}>
+                              <span className="export-option-icon">🔑</span>
+                              <span className="export-option-text">Secrets Only (CSV)</span>
+                              <span className="export-option-count">{sessions.filter(s => s.secrets_detections > 0).length} sessions</span>
                             </div>
 
                             <div className="export-option" onClick={exportJailbreaksOnly}>
@@ -2321,6 +2416,7 @@ const AnalyticsDashboard = () => {
                               <td onClick={() => !selectionMode && fetchBotDetails(session.bot_id)}>
                                 <div className="threat-badges">
                                   <ThreatBadge type="pii" count={session.pii_detections} />
+                                  <ThreatBadge type="secrets" count={session.secrets_detections || 0} />
                                   <ThreatBadge type="jailbreak" count={session.jailbreak_attempts} />
                                   <ThreatBadge type="toxicity" count={session.toxicity_detections} />
                                 </div>
@@ -2375,7 +2471,14 @@ const AnalyticsDashboard = () => {
                     <ResponsiveContainer width="100%" height={300}>
                       <AreaChart data={getTimelineData()}>
                         <CartesianGrid strokeDasharray="3 3" />
-                        <XAxis dataKey="date" tick={{ fontSize: 12 }} />
+                        <XAxis 
+                          dataKey="date" 
+                          tick={{ fontSize: 11 }}
+                          angle={-45}
+                          textAnchor="end"
+                          height={60}
+                          interval={0}
+                        />
                         <YAxis />
                         <Tooltip />
                         <Legend />
@@ -2514,6 +2617,93 @@ const AnalyticsDashboard = () => {
                         />
                       </div>
                     </div>
+
+                    {/* Secrets Detection Card */}
+                    <div className="insight-card">
+                      <div className="insight-header">
+                        <div className="insight-icon" style={{ background: 'linear-gradient(135deg, #8b5cf6 0%, #7c3aed 100%)' }}>
+                          🔑
+                        </div>
+                        <div className="insight-title">Secrets Detection Rate</div>
+                      </div>
+                      <div className="insight-value">
+                        {stats.totalSessions > 0 ? ((sessions.filter(s => s.secrets_detections > 0).length / stats.totalSessions * 100) || 0).toFixed(1) : 0}%
+                      </div>
+                      <div className="insight-description">
+                        {sessions.filter(s => s.secrets_detections > 0).length} sessions with secrets detected
+                      </div>
+                      <div className="progress-bar-container">
+                        <div 
+                          className="progress-bar-fill" 
+                          style={{ 
+                            width: `${stats.totalSessions > 0 ? ((sessions.filter(s => s.secrets_detections > 0).length / stats.totalSessions * 100) || 0) : 0}%`,
+                            background: 'linear-gradient(90deg, #8b5cf6 0%, #7c3aed 100%)'
+                          }}
+                        />
+                      </div>
+                    </div>
+
+                    {/* Average Response Time Card */}
+                    <div className="insight-card">
+                      <div className="insight-header">
+                        <div className="insight-icon" style={{ background: 'linear-gradient(135deg, #06b6d4 0%, #0891b2 100%)' }}>
+                          ⏱️
+                        </div>
+                        <div className="insight-title">Avg Response Time</div>
+                      </div>
+                      <div className="insight-value">
+                        {(() => {
+                          const allEvents = sessions.flatMap(s => allSessionDetails[s.bot_id]?.security_events || []);
+                          const avgTime = allEvents.length > 0 
+                            ? allEvents.reduce((sum, e) => sum + (e.metrics?.total_time || 0), 0) / allEvents.length
+                            : 0;
+                          return avgTime > 0 ? `${avgTime.toFixed(2)}s` : 'N/A';
+                        })()}
+                      </div>
+                      <div className="insight-description">
+                        Average end-to-end request time
+                      </div>
+                      <div className="metric-badge">
+                        {(() => {
+                          const allEvents = sessions.flatMap(s => allSessionDetails[s.bot_id]?.security_events || []);
+                          const avgTime = allEvents.length > 0 
+                            ? allEvents.reduce((sum, e) => sum + (e.metrics?.total_time || 0), 0) / allEvents.length
+                            : 0;
+                          return avgTime < 1 ? '⚡ Fast' : avgTime < 2 ? '✅ Good' : '⏳ Slow';
+                        })()}
+                      </div>
+                    </div>
+
+                    {/* Average Scan Time Card */}
+                    <div className="insight-card">
+                      <div className="insight-header">
+                        <div className="insight-icon" style={{ background: 'linear-gradient(135deg, #f59e0b 0%, #d97706 100%)' }}>
+                          🔍
+                        </div>
+                        <div className="insight-title">Avg Scan Time</div>
+                      </div>
+                      <div className="insight-value">
+                        {(() => {
+                          const allEvents = sessions.flatMap(s => allSessionDetails[s.bot_id]?.security_events || []);
+                          const avgScanTime = allEvents.length > 0 
+                            ? allEvents.reduce((sum, e) => sum + (e.metrics?.scan_time || 0), 0) / allEvents.length
+                            : 0;
+                          return avgScanTime > 0 ? `${avgScanTime.toFixed(2)}s` : 'N/A';
+                        })()}
+                      </div>
+                      <div className="insight-description">
+                        Average security scan duration ({sessions.flatMap(s => allSessionDetails[s.bot_id]?.security_events || []).length} scans)
+                      </div>
+                      <div className="metric-badge">
+                        {(() => {
+                          const allEvents = sessions.flatMap(s => allSessionDetails[s.bot_id]?.security_events || []);
+                          const avgScanTime = allEvents.length > 0 
+                            ? allEvents.reduce((sum, e) => sum + (e.metrics?.scan_time || 0), 0) / allEvents.length
+                            : 0;
+                          return avgScanTime < 1 ? '⚡ Fast' : avgScanTime < 5 ? '✅ Good' : avgScanTime < 10 ? '⚠️ Slow' : '🐌 Very Slow';
+                        })()}
+                      </div>
+                    </div>
                   </div>
 
                   {/* Threat Breakdown Section */}
@@ -2527,6 +2717,17 @@ const AnalyticsDashboard = () => {
                           <div className="threat-stat-label">PII Detections</div>
                           <div className="threat-stat-percentage">
                             {stats.totalPrompts > 0 ? ((stats.totalPII / stats.totalPrompts * 100) || 0).toFixed(2) : 0}% of all prompts
+                          </div>
+                        </div>
+                      </div>
+
+                      <div className="threat-stat">
+                        <div className="threat-stat-icon">🔑</div>
+                        <div className="threat-stat-content">
+                          <div className="threat-stat-value">{stats.totalSecrets.toLocaleString()}</div>
+                          <div className="threat-stat-label">Secrets Detected</div>
+                          <div className="threat-stat-percentage">
+                            {stats.totalPrompts > 0 ? ((stats.totalSecrets / stats.totalPrompts * 100) || 0).toFixed(2) : 0}% of all prompts
                           </div>
                         </div>
                       </div>
@@ -2704,27 +2905,69 @@ const AnalyticsDashboard = () => {
                                 )}
 
                                 <div className="detection-tags">
-                                  {event.detections?.prompt_injection?.detected && (
-                                    <div className="detection-tag prompt-injection">
-                                      ⚠️ Prompt Injection (Risk: {(event.detections.prompt_injection.risk_score * 100).toFixed(0)}%)
+  {event.detections?.prompt_injection?.detected && (
+    <div className="detection-tag prompt-injection">
+      ⚠️ Prompt Injection (Risk: {(event.detections.prompt_injection.risk_score * 100).toFixed(0)}%)
+    </div>
+  )}
+  {event.detections?.pii?.secrets_detected && (
+    <div className="detection-tag secrets">
+      🔑 Secrets Detected (Risk: {(event.detections.pii.secrets_risk_score * 100).toFixed(0)}%)
+    </div>
+  )}
+  {event.detections?.toxicity?.detected && (
+    <div className="detection-tag toxicity">
+      ☣️ Toxicity (Risk: {(event.detections.toxicity.risk_score * 100).toFixed(0)}%)
+    </div>
+  )}
+  {event.detections?.pii?.detected && (
+    <div className="detection-tag pii">
+      🔒 PII: {event.detections.pii.entity_types?.join(', ')} ({event.detections.pii.entity_count} entities)
+    </div>
+  )}
+  {!event.detections?.prompt_injection?.detected && 
+   !event.detections?.pii?.secrets_detected && 
+   !event.detections?.toxicity?.detected && 
+   !event.detections?.pii?.detected && (
+    <div className="detection-tag safe">✅ No Threats Detected</div>
+  )}
+</div>
+
+                                {event.metrics && (
+                                  <div className="event-section" style={{ marginTop: '16px' }}>
+                                    <div className="event-section-title">⏱️ Performance Metrics</div>
+                                    <div className="metrics-grid">
+                                      <div className="metric-item">
+                                        <span className="metric-label">Total Time:</span>
+                                        <span className="metric-value">{event.metrics.total_time?.toFixed(3)}s</span>
+                                      </div>
+                                      <div className="metric-item">
+                                        <span className="metric-label">Security Scan:</span>
+                                        <span className="metric-value">{event.metrics.scan_time?.toFixed(3)}s</span>
+                                      </div>
+                                      {event.metrics.llm_time > 0 && (
+                                        <div className="metric-item">
+                                          <span className="metric-label">LLM Response:</span>
+                                          <span className="metric-value">{event.metrics.llm_time?.toFixed(3)}s</span>
+                                        </div>
+                                      )}
                                     </div>
-                                  )}
-                                  {event.detections?.toxicity?.detected && (
-                                    <div className="detection-tag toxicity">
-                                      ☣️ Toxicity (Risk: {(event.detections.toxicity.risk_score * 100).toFixed(0)}%)
-                                    </div>
-                                  )}
-                                  {event.detections?.pii?.detected && (
-                                    <div className="detection-tag pii">
-                                      🔒 PII: {event.detections.pii.entity_types?.join(', ')} ({event.detections.pii.entity_count} entities)
-                                    </div>
-                                  )}
-                                  {!event.detections?.prompt_injection?.detected && 
-                                   !event.detections?.toxicity?.detected && 
-                                   !event.detections?.pii?.detected && (
-                                    <div className="detection-tag safe">✅ No Threats Detected</div>
-                                  )}
-                                </div>
+                                    
+                                    {event.metrics.scanner_details && Object.keys(event.metrics.scanner_details).length > 0 && (
+                                      <div style={{ marginTop: '12px' }}>
+                                        <div className="event-section-title" style={{ fontSize: '11px', marginBottom: '8px' }}>Scanner Breakdown:</div>
+                                        <div className="scanner-metrics">
+                                          {Object.entries(event.metrics.scanner_details).map(([scanner, time]) => (
+                                            <div key={scanner} className="scanner-metric-item">
+                                              <span className="scanner-name">{scanner.replace('_', ' ').toUpperCase()}</span>
+                                              <span className="scanner-time">{time?.toFixed(3)}s</span>
+                                            </div>
+                                          ))}
+                                        </div>
+                                      </div>
+                                    )}
+                                  </div>
+                                )}
                               </div>
                             </div>
                           );

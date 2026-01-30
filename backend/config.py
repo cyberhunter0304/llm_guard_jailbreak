@@ -30,10 +30,10 @@ SCANNER_CONFIG = {
     "prompt_injection_threshold": 0.8,
     "toxicity_threshold": 0.5,
     "pii_threshold": 0.5,
+    "secrets_threshold": 0.0,  # Binary detection for API keys, passwords, tokens
     "thread_pool_workers": 20
     # 🔧 ADD NEW SCANNER THRESHOLDS HERE:
     # "ban_topics_threshold": 0.7,
-    # "secrets_threshold": 0.0,  # Usually 0.0 for binary detection
     # "code_detection_threshold": 0.6,
     # "sentiment_threshold": 0.5,
     # "language_match_threshold": 0.8,

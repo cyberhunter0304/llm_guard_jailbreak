@@ -94,7 +94,14 @@ async def chat(request: ChatRequest):
             "scan_duration": scan_results.scan_duration,
             "blocked": False,
             "anonymized_prompt": anonymized_prompt if pii_entities else None,
-            "llm_response": None
+            "llm_response": None,
+            "metrics": {
+                "request_start_time": request_start,
+                "scan_time": round(scan_results.scan_duration, 4),
+                "scanner_details": scan_results.detections.get("metrics", {}).get("scanner_times", {}),
+                "llm_time": 0.0,
+                "total_time": 0.0
+            }
         }
 
         # Handle PII Detection
@@ -119,15 +126,19 @@ async def chat(request: ChatRequest):
             if scan_results.detections.get("toxicity", {}).get("detected"):
                 bot_security_log["toxicity_detections"] += 1
             
+            # Track secrets from PII scanner results
+            pii_results = scan_results.detections.get("pii", {})
+            if pii_results.get("secrets_detected", False):
+                bot_security_log["secrets_detections"] += 1
+            
             # Example for new scanners:
-            # if scan_results.detections.get("secrets", {}).get("detected"):
-            #     bot_security_log["secrets_detections"] += 1
             # if scan_results.detections.get("ban_topics", {}).get("detected"):
             #     bot_security_log["banned_topics_detections"] += 1
             # ====================================================================
             
             security_event["blocked"] = True
             security_event["block_reason"] = scan_results.message
+            security_event["metrics"]["total_time"] = round(time.time() - request_start, 4)
             
             bot_security_log["security_events"].append(security_event)
             bot_security_log["last_updated"] = now()
@@ -152,14 +163,21 @@ async def chat(request: ChatRequest):
         # Prompt is safe - call LLM
         logger.info(f"[Bot: {request.bot_id[:16]}...] Safe - calling LLM")
         
+        # Track LLM call time
+        llm_start = time.time()
+        
         # Call OpenRouter (async for better concurrency)
         llm_response = await call_openrouter(prompt_to_send, request.model, has_pii=bool(pii_entities))
+        
+        llm_duration = time.time() - llm_start
         
         assistant_message = llm_response.get("choices", [{}])[0].get("message", {}).get("content", "")
         
         security_event["llm_response"] = assistant_message
         security_event["model_used"] = request.model
         security_event["success"] = True
+        security_event["metrics"]["llm_time"] = round(llm_duration, 4)
+        security_event["metrics"]["total_time"] = round(time.time() - request_start, 4)
         
         bot_security_log["security_events"].append(security_event)
         bot_security_log["last_updated"] = now()
@@ -247,6 +265,7 @@ async def get_bot_security_summary(bot_id: str):
                 "pii_detections": security_data.get("pii_detections", 0),
                 "jailbreak_attempts": security_data.get("jailbreak_attempts", 0),
                 "toxicity_detections": security_data.get("toxicity_detections", 0),
+                "secrets_detections": security_data.get("secrets_detections", 0),
                 "total_events": len(security_data.get("security_events", []))
             }
         }
@@ -332,16 +351,16 @@ async def get_stats():
                 "threshold": 0.5,
                 "description": "Detects and anonymizes personal information",
                 "concurrent_safe": True
+            },
+            "secrets": {
+                "name": "Secrets Scanner",
+                "threshold": 0.0,
+                "description": "Detects API keys, passwords, and tokens",
+                "concurrent_safe": True
             }
             # 🔧 ADD NEW SCANNER INFO FOR API STATS:
             # Document your new scanners in the /api/stats endpoint
             # ================================================================
-            # "secrets": {
-            #     "name": "Secrets Scanner",
-            #     "threshold": 0.0,
-            #     "description": "Detects API keys, passwords, and tokens",
-            #     "concurrent_safe": True
-            # },
             # "ban_topics": {
             #     "name": "Banned Topics Scanner",
             #     "threshold": 0.7,
@@ -360,7 +379,10 @@ async def startup_event():
     logger.info("=" * 80)
     logger.info("🚀 Starting Jailbreak-Protected LLM API - ⚡ CONCURRENT MODE ⚡")
     logger.info("=" * 80)
-    logger.info(f"✓ Loaded 3 security scanners (Prompt Injection, Toxicity, PII)")
+    logger.info(f"✓ Loaded 5 security scanners:")
+    logger.info(f"  - Prompt Injection Scanner")
+    logger.info(f"  - Toxicity Scanner")
+    logger.info(f"  - PII Detection & Anonymization (includes Secrets)")
     logger.info("✓ Thread-safe PII scanner with isolated instances")
     logger.info("✓ File operations protected with locks")
     logger.info("✓ READY FOR CONCURRENT BOT SIMULATION")

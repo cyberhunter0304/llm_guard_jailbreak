@@ -34,11 +34,11 @@ def load_bot_security_log(bot_id: str) -> dict:
             "blocked_prompts": 0,
             "pii_detections": 0,
             "jailbreak_attempts": 0,
-            "toxicity_detections": 0
+            "toxicity_detections": 0,
+            "secrets_detections": 0
             # 🔧 ADD NEW SCANNER STATISTICS COUNTERS:
             # Initialize counters for your new scanners here
             # ================================================================
-            # "secrets_detections": 0,
             # "banned_topics_detections": 0,
             # "code_detections": 0,
             # "sentiment_issues": 0,
@@ -90,11 +90,11 @@ def list_all_bot_sessions() -> Dict[str, any]:
                     "blocked_prompts": data.get("blocked_prompts", 0),
                     "pii_detections": data.get("pii_detections", 0),
                     "jailbreak_attempts": data.get("jailbreak_attempts", 0),
-                    "toxicity_detections": data.get("toxicity_detections", 0)
+                    "toxicity_detections": data.get("toxicity_detections", 0),
+                    "secrets_detections": data.get("secrets_detections", 0)
                     # 🔧 ADD NEW SCANNER STATISTICS TO LISTING:
                     # Include your new scanner stats in the session list
                     # ============================================================
-                    # "secrets_detections": data.get("secrets_detections", 0),
                     # "banned_topics_detections": data.get("banned_topics_detections", 0),
                     # "code_detections": data.get("code_detections", 0),
                     # ============================================================

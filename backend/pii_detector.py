@@ -1,13 +1,13 @@
 """
 PII Detection Module
-Thread-safe PII detection and anonymization
+Thread-safe PII detection and anonymization with Secrets detection
 """
 import logging
 import threading
 import re
 from typing import Tuple, List, Dict
 from llm_guard.vault import Vault
-from llm_guard.input_scanners import Anonymize
+from llm_guard.input_scanners import Anonymize, Secrets
 from llm_guard.input_scanners.anonymize_helpers import BERT_LARGE_NER_CONF
 from config import SCANNER_CONFIG
 
@@ -86,31 +86,113 @@ class ThreadSafePIIDetector:
         return vault, scanner
     
     @staticmethod
-    def anonymize(text: str) -> Tuple[str, List[Dict]]:
-        """Detect and anonymize PII - Creates isolated instance per call"""
+    def anonymize(text: str) -> Tuple[str, List[Dict], Dict[str, any]]:
+        """
+        Detect and anonymize PII using multiple scanners
+        Returns: (anonymized_text, entities_list, scanner_results)
+        
+        Runs two scanners in sequence:
+        1. PII/Anonymize - Detects and anonymizes names, emails, SSN, etc.
+        2. Secrets - Detects API keys, passwords, tokens
+        """
+        entities = []
+        scanner_results = {
+            "secrets": {"detected": False, "is_valid": True, "risk_score": 0.0}
+        }
+        
         try:
-            # Create NEW instance for this specific request
-            vault, scanner = ThreadSafePIIDetector.create_detector()
-            
-            sanitized_text, _, risk_score = scanner.scan(text)
+            # ================================================================
+            # SCANNER 1: PII/Anonymize Scanner
+            # ================================================================
+            try:
+                vault, pii_scanner = ThreadSafePIIDetector.create_detector()
+                sanitized_text, is_valid_pii, risk_score_pii = pii_scanner.scan(text)
 
-            entities = []
-            tokens = re.findall(r'\[([A-Z_]+)_(\d+)\]', sanitized_text)
+                # Extract entities from anonymized text
+                tokens = re.findall(r'\[([A-Z_]+)_(\d+)\]', sanitized_text)
+                
+                # Use a set to track unique tokens to avoid duplicates
+                seen_tokens = set()
+                for entity_type, entity_num in tokens:
+                    full_token = f"[{entity_type}_{entity_num}]"
+                    # Only add if we haven't seen this token before
+                    if full_token not in seen_tokens:
+                        seen_tokens.add(full_token)
+                        entities.append({
+                            "type": entity_type,
+                            "value": "REDACTED",
+                            "token": full_token,
+                            "source": "pii"
+                        })
+                
+                if entities:
+                    logger.info(f"PII Scanner: Found {len(entities)} unique entities")
+                    
+            except Exception as e:
+                logger.error(f"PII Scanner failed: {str(e)}")
+                sanitized_text = text
             
-            for entity_type, entity_num in tokens:
-                full_token = f"[{entity_type}_{entity_num}]"
-                entities.append({
-                    "type": entity_type,
-                    "value": "REDACTED",
-                    "token": full_token
-                })
-
+            # ================================================================
+            # SCANNER 2: Secrets Scanner
+            # ================================================================
+            try:
+                secrets_scanner = Secrets(redact_mode="all")
+                _, is_valid_secrets, risk_score_secrets = secrets_scanner.scan(text)
+                secrets_detected = not is_valid_secrets
+                
+                scanner_results["secrets"] = {
+                    "detected": secrets_detected,
+                    "is_valid": is_valid_secrets,
+                    "risk_score": float(risk_score_secrets)
+                }
+                
+                if secrets_detected:
+                    logger.info(f"Secrets Scanner: Detected secrets (risk: {risk_score_secrets})")
+                    
+            except Exception as e:
+                logger.error(f"Secrets Scanner failed: {str(e)}")
+            
+            # ================================================================
+            # Deduplicate entities from all scanners
+            # ================================================================
+            entities = ThreadSafePIIDetector.deduplicate_entities(entities)
+            
             if entities:
-                logger.debug(f"PII detected: {len(entities)} entities found")
+                logger.info(f"Total unique PII entities detected: {len(entities)}")
             
-            return sanitized_text, entities
+            return sanitized_text, entities, scanner_results
             
         except Exception as e:
-            logger.error(f"PII Anonymization failed: {str(e)}")
-            # Return original text if PII detection fails
-            return text, []
+            logger.error(f"PII/Secrets detection failed: {str(e)}")
+            # Return original text if detection fails
+            return text, [], scanner_results
+    
+    @staticmethod
+    def deduplicate_entities(entities: List[Dict]) -> List[Dict]:
+        """
+        Deduplicate PII entities based on token
+        Used when multiple scanners detect the same entities
+        
+        Args:
+            entities: List of entity dictionaries with 'token' field
+            
+        Returns:
+            Deduplicated list of entities
+        """
+        if not entities:
+            return []
+        
+        seen_tokens = set()
+        deduplicated = []
+        
+        for entity in entities:
+            entity_token = entity.get("token", "")
+            # Only add if we haven't seen this token before
+            if entity_token and entity_token not in seen_tokens:
+                seen_tokens.add(entity_token)
+                deduplicated.append(entity)
+        
+        if len(entities) != len(deduplicated):
+            logger.debug(f"Deduplicated PII entities: {len(entities)} -> {len(deduplicated)}")
+        
+        return deduplicated
