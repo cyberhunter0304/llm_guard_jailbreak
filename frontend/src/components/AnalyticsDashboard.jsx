@@ -2436,7 +2436,7 @@ const AnalyticsDashboard = () => {
                   <StatCard icon="📝" label="Total Prompts" value={stats.totalPrompts} color="#10b981" />
                   <StatCard icon="🚫" label="Blocked Prompts" value={stats.totalBlocked} color="#ef4444" />
                   <StatCard icon="🔒" label="PII Detections" value={stats.totalPII} color="#f59e0b" />
-                                    <StatCard icon="🔑" label="Secrets Detected" value={stats.totalSecrets} color="#8b5cf6" />
+                  <StatCard icon="🔑" label="Secrets Detected" value={stats.totalSecrets} color="#8b5cf6" />
                   <StatCard icon="⚠️" label="Jailbreak Attempts" value={stats.totalJailbreaks} color="#dc2626" />
                   <StatCard icon="☣️" label="Toxicity Detected" value={stats.totalToxicity} color="#991b1b" />
                 </div>
