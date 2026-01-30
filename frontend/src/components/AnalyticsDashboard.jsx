@@ -11,6 +11,7 @@ const AnalyticsDashboard = () => {
   const [view, setView] = useState('overview'); // 'overview', 'analytics', or 'details'
   const [detailsTab, setDetailsTab] = useState('events');
   const [searchTerm, setSearchTerm] = useState('');
+  const [searchMode, setSearchMode] = useState('botId'); // 'botId' or 'prompt'
   const [filterType, setFilterType] = useState('all');
   const [sortBy, setSortBy] = useState('date-desc');
   const [currentPage, setCurrentPage] = useState(1);
@@ -18,6 +19,7 @@ const AnalyticsDashboard = () => {
   const [showExportMenu, setShowExportMenu] = useState(false);
   const [selectedSessions, setSelectedSessions] = useState(new Set());
   const [selectionMode, setSelectionMode] = useState(false);
+  const [promptSearchResults, setPromptSearchResults] = useState([]);
   const [stats, setStats] = useState({
     totalSessions: 0,
     totalPrompts: 0,
@@ -67,6 +69,8 @@ const AnalyticsDashboard = () => {
       
       setStats(totalStats);
       setLoading(false);
+      
+      // Note: fetchAllSessionDetails will be called by useEffect when sessions update
     } catch (error) {
       console.error('Failed to fetch sessions:', error);
       setLoading(false);
@@ -77,9 +81,20 @@ const AnalyticsDashboard = () => {
     let filtered = [...sessions];
 
     if (searchTerm) {
-      filtered = filtered.filter(session =>
-        session.bot_id.toLowerCase().includes(searchTerm.toLowerCase())
-      );
+      if (searchMode === 'botId') {
+        filtered = filtered.filter(session =>
+          session.bot_id.toLowerCase().includes(searchTerm.toLowerCase())
+        );
+      } else if (searchMode === 'prompt') {
+        // For prompt search, we need to check if any session has matching prompts
+        const matchingBotIds = new Set(promptSearchResults.map(result => result.bot_id));
+        if (matchingBotIds.size > 0) {
+          filtered = filtered.filter(session => matchingBotIds.has(session.bot_id));
+        } else if (searchTerm.length >= 3) {
+          // If search term is long enough but no results yet, show empty
+          filtered = [];
+        }
+      }
     }
 
     if (filterType === 'threats') {
@@ -217,6 +232,80 @@ const AnalyticsDashboard = () => {
     
     return piiData;
   };
+
+  // Fetch all session details on mount for instant prompt search
+  const [allSessionDetails, setAllSessionDetails] = useState({});
+  const [loadingPromptData, setLoadingPromptData] = useState(false);
+
+  const fetchAllSessionDetails = async () => {
+    setLoadingPromptData(true);
+    const details = {};
+    
+    await Promise.all(
+      sessions.map(async (session) => {
+        try {
+          const response = await fetch(`${BACKEND_URL}/api/security/${session.bot_id}`);
+          const data = await response.json();
+          details[session.bot_id] = data;
+        } catch (error) {
+          console.error(`Failed to fetch details for ${session.bot_id}:`, error);
+        }
+      })
+    );
+    
+    setAllSessionDetails(details);
+    setLoadingPromptData(false);
+  };
+
+  // Load all session details when sessions change
+  useEffect(() => {
+    if (sessions.length > 0) {
+      fetchAllSessionDetails();
+    }
+  }, [sessions]);
+
+  const searchPrompts = (searchQuery) => {
+    if (!searchQuery || searchQuery.length < 3) {
+      setPromptSearchResults([]);
+      return;
+    }
+
+    const lowerQuery = searchQuery.toLowerCase();
+    const results = [];
+
+    // Search through cached session details
+    Object.entries(allSessionDetails).forEach(([botId, details]) => {
+      if (details.security_events) {
+        const matchingEvents = details.security_events.filter(event => 
+          event.prompt?.toLowerCase().includes(lowerQuery) ||
+          event.anonymized_prompt?.toLowerCase().includes(lowerQuery) ||
+          event.llm_response?.toLowerCase().includes(lowerQuery)
+        );
+
+        if (matchingEvents.length > 0) {
+          results.push({
+            bot_id: botId,
+            matchCount: matchingEvents.length,
+            matches: matchingEvents.map(event => ({
+              prompt: event.prompt,
+              timestamp: event.timestamp
+            }))
+          });
+        }
+      }
+    });
+
+    setPromptSearchResults(results);
+  };
+
+  // Instant search - no debounce
+  useEffect(() => {
+    if (searchMode === 'prompt') {
+      searchPrompts(searchTerm);
+    } else if (searchMode === 'botId') {
+      setPromptSearchResults([]);
+    }
+  }, [searchTerm, searchMode, allSessionDetails]);
 
   // Enhanced Export Functions
   const downloadCSV = (data, filename) => {
@@ -800,7 +889,7 @@ const AnalyticsDashboard = () => {
 
         .search-input {
           width: 100%;
-          padding: 12px 16px 12px 44px;
+          padding: 12px 130px 12px 44px;
           border: 2px solid #e5e7eb;
           border-radius: 10px;
           font-size: 15px;
@@ -811,6 +900,33 @@ const AnalyticsDashboard = () => {
           outline: none;
           border-color: #F15843;
           box-shadow: 0 0 0 3px rgba(255, 107, 53, 0.1);
+        }
+
+        .search-mode-toggle {
+          position: absolute;
+          right: 8px;
+          top: 50%;
+          transform: translateY(-50%);
+          padding: 6px 12px;
+          background: linear-gradient(135deg, #F15843 0%, #fc7777 100%);
+          color: white;
+          border: none;
+          border-radius: 8px;
+          font-size: 13px;
+          font-weight: 600;
+          cursor: pointer;
+          transition: all 0.2s;
+          box-shadow: 0 2px 6px rgba(241, 88, 67, 0.25);
+        }
+
+        .search-mode-toggle:hover {
+          background: linear-gradient(135deg, #e04632 0%, #fc6666 100%);
+          transform: translateY(-50%) scale(1.05);
+          box-shadow: 0 4px 8px rgba(241, 88, 67, 0.35);
+        }
+
+        .search-mode-toggle:active {
+          transform: translateY(-50%) scale(0.98);
         }
 
         .filter-group {
@@ -1166,6 +1282,28 @@ const AnalyticsDashboard = () => {
           font-size: 13px;
           color: #374151;
           font-weight: 600;
+        }
+
+        .prompt-match-badge {
+          display: inline-block;
+          margin-left: 8px;
+          padding: 4px 10px;
+          background: linear-gradient(135deg, #3b82f6 0%, #2563eb 100%);
+          color: white;
+          border-radius: 12px;
+          font-size: 11px;
+          font-weight: 700;
+          letter-spacing: 0.3px;
+          animation: pulse 2s infinite;
+        }
+
+        @keyframes pulse {
+          0%, 100% {
+            opacity: 1;
+          }
+          50% {
+            opacity: 0.8;
+          }
         }
 
         .time-info {
@@ -1544,9 +1682,252 @@ const AnalyticsDashboard = () => {
           color: #374151;
         }
 
+        /* Insights Dashboard Styles */
+        .insights-grid {
+          display: grid;
+          grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+          gap: 20px;
+          margin-bottom: 32px;
+        }
+
+        .insight-card {
+          background: white;
+          padding: 24px;
+          border-radius: 16px;
+          box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+          transition: all 0.3s;
+          border: 2px solid transparent;
+        }
+
+        .insight-card:hover {
+          transform: translateY(-4px);
+          box-shadow: 0 8px 24px rgba(0,0,0,0.12);
+          border-color: #F15843;
+        }
+
+        .insight-header {
+          display: flex;
+          align-items: center;
+          gap: 12px;
+          margin-bottom: 16px;
+        }
+
+        .insight-icon {
+          width: 48px;
+          height: 48px;
+          border-radius: 12px;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          font-size: 24px;
+          box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+        }
+
+        .insight-title {
+          font-size: 14px;
+          font-weight: 600;
+          color: #6b7280;
+          text-transform: uppercase;
+          letter-spacing: 0.5px;
+        }
+
+        .insight-value {
+          font-size: 48px;
+          font-weight: 800;
+          background: linear-gradient(135deg, #F15843 0%, #fc7777 100%);
+          -webkit-background-clip: text;
+          -webkit-text-fill-color: transparent;
+          background-clip: text;
+          margin-bottom: 8px;
+          line-height: 1.2;
+        }
+
+        .insight-description {
+          font-size: 14px;
+          color: #6b7280;
+          margin-bottom: 16px;
+        }
+
+        .progress-bar-container {
+          width: 100%;
+          height: 8px;
+          background: #f3f4f6;
+          border-radius: 4px;
+          overflow: hidden;
+        }
+
+        .progress-bar-fill {
+          height: 100%;
+          border-radius: 4px;
+          transition: width 1s ease;
+          box-shadow: 0 2px 8px rgba(0,0,0,0.2);
+        }
+
+        .metric-badge {
+          display: inline-block;
+          padding: 8px 16px;
+          background: linear-gradient(135deg, #fef3c7 0%, #fde68a 100%);
+          color: #92400e;
+          border-radius: 20px;
+          font-size: 13px;
+          font-weight: 700;
+          margin-top: 12px;
+        }
+
+        /* Threat Breakdown Section */
+        .threat-breakdown-section {
+          margin-top: 32px;
+          padding: 24px;
+          background: linear-gradient(135deg, #f9fafb 0%, #f3f4f6 100%);
+          border-radius: 16px;
+          margin-bottom: 32px;
+        }
+
+        .section-subtitle {
+          font-size: 18px;
+          font-weight: 700;
+          color: #1f2937;
+          margin-bottom: 20px;
+          display: flex;
+          align-items: center;
+          gap: 10px;
+        }
+
+        .threat-breakdown-grid {
+          display: grid;
+          grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+          gap: 20px;
+        }
+
+        .threat-stat {
+          background: white;
+          padding: 20px;
+          border-radius: 12px;
+          display: flex;
+          align-items: center;
+          gap: 16px;
+          box-shadow: 0 2px 4px rgba(0,0,0,0.06);
+          transition: all 0.3s;
+        }
+
+        .threat-stat:hover {
+          transform: translateY(-2px);
+          box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+        }
+
+        .threat-stat-icon {
+          font-size: 32px;
+          width: 56px;
+          height: 56px;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          background: #f9fafb;
+          border-radius: 12px;
+        }
+
+        .threat-stat-content {
+          flex: 1;
+        }
+
+        .threat-stat-value {
+          font-size: 28px;
+          font-weight: 700;
+          color: #1f2937;
+        }
+
+        .threat-stat-label {
+          font-size: 13px;
+          color: #6b7280;
+          font-weight: 600;
+          margin-top: 4px;
+        }
+
+        .threat-stat-percentage {
+          font-size: 12px;
+          color: #9ca3af;
+          margin-top: 4px;
+        }
+
+        /* Security Health Score Section */
+        .security-health-section {
+          margin-top: 32px;
+          padding: 32px;
+          background: linear-gradient(135deg, #fbfbfb 0%, #f8fafc 100%);
+          border-radius: 16px;
+          border: 2px solid #e5e7eb;
+        }
+
+        .health-score-container {
+          display: flex;
+          align-items: center;
+          gap: 48px;
+          flex-wrap: wrap;
+          justify-content: center;
+        }
+
+        .health-score-circle {
+          position: relative;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+        }
+
+        .health-score-value {
+          position: absolute;
+          font-size: 48px;
+          font-weight: 800;
+          background: linear-gradient(135deg, #10b981 0%, #059669 100%);
+          -webkit-background-clip: text;
+          -webkit-text-fill-color: transparent;
+          background-clip: text;
+        }
+
+        .health-score-info {
+          flex: 1;
+          min-width: 300px;
+        }
+
+        .health-score-title {
+          font-size: 24px;
+          font-weight: 700;
+          color: #1f2937;
+          margin-bottom: 12px;
+        }
+
+        .health-score-description {
+          font-size: 14px;
+          color: #6b7280;
+          line-height: 1.6;
+          margin-bottom: 16px;
+        }
+
+        .health-score-rating {
+          padding: 12px 20px;
+          background: white;
+          border-radius: 12px;
+          font-size: 15px;
+          font-weight: 600;
+          color: #374151;
+          border: 2px solid #e5e7eb;
+          display: inline-block;
+        }
+
         @media (max-width: 1024px) {
           .charts-grid {
             grid-template-columns: 1fr;
+          }
+
+          .insights-grid {
+            grid-template-columns: 1fr;
+          }
+
+          .threat-breakdown-grid {
+            grid-template-columns: 1fr;
+          }
+
+          .health-score-container {
+            flex-direction: column;
           }
         }
 
@@ -1626,6 +2007,12 @@ const AnalyticsDashboard = () => {
                 <div className="header-stat-value">{stats.totalBlocked.toLocaleString()}</div>
                 <div className="header-stat-label">Blocked Threats</div>
               </div>
+              {loadingPromptData && (
+                <div className="header-stat">
+                  <div className="header-stat-value">⏳</div>
+                  <div className="header-stat-label">Indexing Prompts...</div>
+                </div>
+              )}
             </div>
           </div>
         </div>
@@ -1658,6 +2045,11 @@ const AnalyticsDashboard = () => {
             <div className="loading-spinner"></div>
             Loading analytics data...
           </div>
+        ) : loadingPromptData ? (
+          <div className="loading">
+            <div className="loading-spinner"></div>
+            Loading prompt data for instant search...
+          </div>
         ) : (
           <>
             {view === 'overview' ? (
@@ -1678,10 +2070,20 @@ const AnalyticsDashboard = () => {
                       <input
                         type="text"
                         className="search-input"
-                        placeholder="Search by Bot ID..."
+                        placeholder={searchMode === 'botId' ? 'Search by Bot ID...' : 'Search by Prompt (min 3 characters)...'}
                         value={searchTerm}
                         onChange={(e) => setSearchTerm(e.target.value)}
                       />
+                      <button 
+                        className="search-mode-toggle" 
+                        onClick={() => {
+                          setSearchMode(searchMode === 'botId' ? 'prompt' : 'botId');
+                          setSearchTerm('');
+                        }}
+                        title={`Switch to search by ${searchMode === 'botId' ? 'Prompt' : 'Bot ID'}`}
+                      >
+                        {searchMode === 'botId' ? '🤖 ID' : '💬 Prompt'}
+                      </button>
                     </div>
 
                     <div className="filter-group">
@@ -1812,6 +2214,12 @@ const AnalyticsDashboard = () => {
                   <div className="results-info">
                     <div>
                       Showing {indexOfFirstItem + 1}-{Math.min(indexOfLastItem, filteredSessions.length)} of {filteredSessions.length} sessions
+                      {searchMode === 'prompt' && searchTerm && promptSearchResults.length > 0 && (
+                        <span className="filter-badge" style={{ background: 'linear-gradient(135deg, #3b82f6 0%, #2563eb 100%)' }}>
+                          💬 Prompt Search: {promptSearchResults.reduce((sum, r) => sum + r.matchCount, 0)} matches in {promptSearchResults.length} sessions
+                          <button className="clear-filter-btn" onClick={() => setSearchTerm('')}>✕</button>
+                        </span>
+                      )}
                       {filterType !== 'all' && (
                         <span className="filter-badge">
                           Filtered by: {filterType.charAt(0).toUpperCase() + filterType.slice(1)}
@@ -1852,8 +2260,16 @@ const AnalyticsDashboard = () => {
                   {filteredSessions.length === 0 ? (
                     <div className="empty-state">
                       <div className="empty-state-icon">{searchTerm || filterType !== 'all' ? '🔍' : '📭'}</div>
-                      <div className="empty-state-title">{searchTerm || filterType !== 'all' ? 'No matching sessions' : 'No sessions yet'}</div>
-                      <div>{searchTerm || filterType !== 'all' ? 'Try adjusting your search or filters' : 'Start a chat to see security analytics here'}</div>
+                      <div className="empty-state-title">
+                        {searchMode === 'prompt' && searchTerm && searchTerm.length < 3 
+                          ? 'Enter at least 3 characters to search' 
+                          : (searchTerm || filterType !== 'all' ? 'No matching sessions' : 'No sessions yet')}
+                      </div>
+                      <div>
+                        {searchMode === 'prompt' && searchTerm && searchTerm.length >= 3 
+                          ? 'No prompts found containing this text. Try different keywords.' 
+                          : (searchTerm || filterType !== 'all' ? 'Try adjusting your search or filters' : 'Start a chat to see security analytics here')}
+                      </div>
                     </div>
                   ) : (
                     <table className="sessions-table">
@@ -1867,42 +2283,51 @@ const AnalyticsDashboard = () => {
                         </tr>
                       </thead>
                       <tbody>
-                        {currentItems.map((session) => (
-                          <tr key={session.bot_id}>
-                            {selectionMode && (
-                              <td className="checkbox-cell" onClick={(e) => e.stopPropagation()}>
-                                <input
-                                  type="checkbox"
-                                  className="session-checkbox"
-                                  checked={selectedSessions.has(session.bot_id)}
-                                  onChange={() => toggleSessionSelection(session.bot_id)}
-                                />
-                              </td>
-                            )}
-                            <td onClick={() => !selectionMode && fetchBotDetails(session.bot_id)}>
-                              <span className="bot-id">{session.bot_id.substring(0, 24)}...</span>
-                            </td>
-                            <td onClick={() => !selectionMode && fetchBotDetails(session.bot_id)}>
-                              <div className="time-info">
-                                <div className="time-relative">{getRelativeTime(session.created_at)}</div>
-                                <div className="time-absolute">{formatDate(session.created_at)}</div>
-                              </div>
-                            </td>
-                            <td onClick={() => !selectionMode && fetchBotDetails(session.bot_id)}>
-                              <strong>{session.total_prompts}</strong>
-                              {session.blocked_prompts > 0 && (
-                                <span style={{ color: '#ef4444', marginLeft: 8, fontSize: 13 }}>({session.blocked_prompts} blocked)</span>
+                        {currentItems.map((session) => {
+                          const promptMatch = promptSearchResults.find(r => r.bot_id === session.bot_id);
+                          
+                          return (
+                            <tr key={session.bot_id}>
+                              {selectionMode && (
+                                <td className="checkbox-cell" onClick={(e) => e.stopPropagation()}>
+                                  <input
+                                    type="checkbox"
+                                    className="session-checkbox"
+                                    checked={selectedSessions.has(session.bot_id)}
+                                    onChange={() => toggleSessionSelection(session.bot_id)}
+                                  />
+                                </td>
                               )}
-                            </td>
-                            <td onClick={() => !selectionMode && fetchBotDetails(session.bot_id)}>
-                              <div className="threat-badges">
-                                <ThreatBadge type="pii" count={session.pii_detections} />
-                                <ThreatBadge type="jailbreak" count={session.jailbreak_attempts} />
-                                <ThreatBadge type="toxicity" count={session.toxicity_detections} />
-                              </div>
-                            </td>
-                          </tr>
-                        ))}
+                              <td onClick={() => !selectionMode && fetchBotDetails(session.bot_id)}>
+                                <span className="bot-id">{session.bot_id.substring(0, 24)}...</span>
+                                {promptMatch && (
+                                  <span className="prompt-match-badge">
+                                    💬 {promptMatch.matchCount} match{promptMatch.matchCount !== 1 ? 'es' : ''}
+                                  </span>
+                                )}
+                              </td>
+                              <td onClick={() => !selectionMode && fetchBotDetails(session.bot_id)}>
+                                <div className="time-info">
+                                  <div className="time-relative">{getRelativeTime(session.created_at)}</div>
+                                  <div className="time-absolute">{formatDate(session.created_at)}</div>
+                                </div>
+                              </td>
+                              <td onClick={() => !selectionMode && fetchBotDetails(session.bot_id)}>
+                                <strong>{session.total_prompts}</strong>
+                                {session.blocked_prompts > 0 && (
+                                  <span style={{ color: '#ef4444', marginLeft: 8, fontSize: 13 }}>({session.blocked_prompts} blocked)</span>
+                                )}
+                              </td>
+                              <td onClick={() => !selectionMode && fetchBotDetails(session.bot_id)}>
+                                <div className="threat-badges">
+                                  <ThreatBadge type="pii" count={session.pii_detections} />
+                                  <ThreatBadge type="jailbreak" count={session.jailbreak_attempts} />
+                                  <ThreatBadge type="toxicity" count={session.toxicity_detections} />
+                                </div>
+                              </td>
+                            </tr>
+                          );
+                        })}
                       </tbody>
                     </table>
                   )}
@@ -1993,12 +2418,189 @@ const AnalyticsDashboard = () => {
                 </div>
 
                 <div className="sessions-container">
-                  <div className="section-title">📊 Analytics Summary</div>
-                  <div style={{ padding: '20px', color: '#6b7280', lineHeight: '1.8' }}>
-                    <p><strong>Detection Rate:</strong> {stats.totalSessions > 0 ? ((stats.totalBlocked / stats.totalPrompts * 100) || 0).toFixed(2) : 0}% of prompts were blocked</p>
-                    <p><strong>PII Detection Rate:</strong> {stats.totalSessions > 0 ? ((sessions.filter(s => s.pii_detections > 0).length / stats.totalSessions * 100) || 0).toFixed(2) : 0}% of sessions contained PII</p>
-                    <p><strong>Average Prompts per Session:</strong> {stats.totalSessions > 0 ? (stats.totalPrompts / stats.totalSessions).toFixed(2) : 0}</p>
-                    <p><strong>Clean Sessions:</strong> {sessions.filter(s => s.pii_detections === 0 && s.jailbreak_attempts === 0 && s.toxicity_detections === 0 && s.blocked_prompts === 0).length} ({stats.totalSessions > 0 ? ((sessions.filter(s => s.pii_detections === 0 && s.jailbreak_attempts === 0 && s.toxicity_detections === 0 && s.blocked_prompts === 0).length / stats.totalSessions * 100) || 0).toFixed(2) : 0}%)</p>
+                  <div className="section-title">💡 Key Insights & Metrics</div>
+                  
+                  <div className="insights-grid">
+                    {/* Detection Rate Card */}
+                    <div className="insight-card">
+                      <div className="insight-header">
+                        <div className="insight-icon" style={{ background: 'linear-gradient(135deg, #ef4444 0%, #dc2626 100%)' }}>
+                          🛡️
+                        </div>
+                        <div className="insight-title">Threat Detection Rate</div>
+                      </div>
+                      <div className="insight-value">
+                        {stats.totalSessions > 0 ? ((stats.totalBlocked / stats.totalPrompts * 100) || 0).toFixed(1) : 0}%
+                      </div>
+                      <div className="insight-description">
+                        {stats.totalBlocked.toLocaleString()} out of {stats.totalPrompts.toLocaleString()} prompts blocked
+                      </div>
+                      <div className="progress-bar-container">
+                        <div 
+                          className="progress-bar-fill" 
+                          style={{ 
+                            width: `${stats.totalSessions > 0 ? ((stats.totalBlocked / stats.totalPrompts * 100) || 0) : 0}%`,
+                            background: 'linear-gradient(90deg, #ef4444 0%, #dc2626 100%)'
+                          }}
+                        />
+                      </div>
+                    </div>
+
+                    {/* PII Detection Card */}
+                    <div className="insight-card">
+                      <div className="insight-header">
+                        <div className="insight-icon" style={{ background: 'linear-gradient(135deg, #f59e0b 0%, #d97706 100%)' }}>
+                          🔐
+                        </div>
+                        <div className="insight-title">PII Detection Rate</div>
+                      </div>
+                      <div className="insight-value">
+                        {stats.totalSessions > 0 ? ((sessions.filter(s => s.pii_detections > 0).length / stats.totalSessions * 100) || 0).toFixed(1) : 0}%
+                      </div>
+                      <div className="insight-description">
+                        {sessions.filter(s => s.pii_detections > 0).length} sessions with PII detected
+                      </div>
+                      <div className="progress-bar-container">
+                        <div 
+                          className="progress-bar-fill" 
+                          style={{ 
+                            width: `${stats.totalSessions > 0 ? ((sessions.filter(s => s.pii_detections > 0).length / stats.totalSessions * 100) || 0) : 0}%`,
+                            background: 'linear-gradient(90deg, #f59e0b 0%, #d97706 100%)'
+                          }}
+                        />
+                      </div>
+                    </div>
+
+                    {/* Average Prompts Card */}
+                    <div className="insight-card">
+                      <div className="insight-header">
+                        <div className="insight-icon" style={{ background: 'linear-gradient(135deg, #3b82f6 0%, #2563eb 100%)' }}>
+                          📈
+                        </div>
+                        <div className="insight-title">Avg Prompts / Session</div>
+                      </div>
+                      <div className="insight-value">
+                        {stats.totalSessions > 0 ? (stats.totalPrompts / stats.totalSessions).toFixed(1) : 0}
+                      </div>
+                      <div className="insight-description">
+                        {stats.totalPrompts.toLocaleString()} total prompts across all sessions
+                      </div>
+                      <div className="metric-badge">
+                        {stats.totalSessions > 0 && (stats.totalPrompts / stats.totalSessions) > 5 ? '🔥 High Activity' : '📊 Normal'}
+                      </div>
+                    </div>
+
+                    {/* Clean Sessions Card */}
+                    <div className="insight-card">
+                      <div className="insight-header">
+                        <div className="insight-icon" style={{ background: 'linear-gradient(135deg, #10b981 0%, #059669 100%)' }}>
+                          ✨
+                        </div>
+                        <div className="insight-title">Clean Sessions</div>
+                      </div>
+                      <div className="insight-value">
+                        {stats.totalSessions > 0 ? ((sessions.filter(s => s.pii_detections === 0 && s.jailbreak_attempts === 0 && s.toxicity_detections === 0 && s.blocked_prompts === 0).length / stats.totalSessions * 100) || 0).toFixed(1) : 0}%
+                      </div>
+                      <div className="insight-description">
+                        {sessions.filter(s => s.pii_detections === 0 && s.jailbreak_attempts === 0 && s.toxicity_detections === 0 && s.blocked_prompts === 0).length} sessions with no threats
+                      </div>
+                      <div className="progress-bar-container">
+                        <div 
+                          className="progress-bar-fill" 
+                          style={{ 
+                            width: `${stats.totalSessions > 0 ? ((sessions.filter(s => s.pii_detections === 0 && s.jailbreak_attempts === 0 && s.toxicity_detections === 0 && s.blocked_prompts === 0).length / stats.totalSessions * 100) || 0) : 0}%`,
+                            background: 'linear-gradient(90deg, #10b981 0%, #059669 100%)'
+                          }}
+                        />
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Threat Breakdown Section */}
+                  <div className="threat-breakdown-section">
+                    <div className="section-subtitle">🎯 Threat Type Breakdown</div>
+                    <div className="threat-breakdown-grid">
+                      <div className="threat-stat">
+                        <div className="threat-stat-icon">🔒</div>
+                        <div className="threat-stat-content">
+                          <div className="threat-stat-value">{stats.totalPII.toLocaleString()}</div>
+                          <div className="threat-stat-label">PII Detections</div>
+                          <div className="threat-stat-percentage">
+                            {stats.totalPrompts > 0 ? ((stats.totalPII / stats.totalPrompts * 100) || 0).toFixed(2) : 0}% of all prompts
+                          </div>
+                        </div>
+                      </div>
+
+                      <div className="threat-stat">
+                        <div className="threat-stat-icon">⚠️</div>
+                        <div className="threat-stat-content">
+                          <div className="threat-stat-value">{stats.totalJailbreaks.toLocaleString()}</div>
+                          <div className="threat-stat-label">Jailbreak Attempts</div>
+                          <div className="threat-stat-percentage">
+                            {stats.totalPrompts > 0 ? ((stats.totalJailbreaks / stats.totalPrompts * 100) || 0).toFixed(2) : 0}% of all prompts
+                          </div>
+                        </div>
+                      </div>
+
+                      <div className="threat-stat">
+                        <div className="threat-stat-icon">☣️</div>
+                        <div className="threat-stat-content">
+                          <div className="threat-stat-value">{stats.totalToxicity.toLocaleString()}</div>
+                          <div className="threat-stat-label">Toxicity Detected</div>
+                          <div className="threat-stat-percentage">
+                            {stats.totalPrompts > 0 ? ((stats.totalToxicity / stats.totalPrompts * 100) || 0).toFixed(2) : 0}% of all prompts
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Security Health Score */}
+                  <div className="security-health-section">
+                    <div className="section-subtitle">🏆 Security Health Score</div>
+                    <div className="health-score-container">
+                      <div className="health-score-circle">
+                        <svg width="200" height="200" viewBox="0 0 200 200">
+                          <circle
+                            cx="100"
+                            cy="100"
+                            r="80"
+                            fill="none"
+                            stroke="#e5e7eb"
+                            strokeWidth="20"
+                          />
+                          <circle
+                            cx="100"
+                            cy="100"
+                            r="80"
+                            fill="none"
+                            stroke="#10b981"
+                            strokeWidth="20"
+                            strokeDasharray={`${(stats.totalSessions > 0 ? ((sessions.filter(s => s.pii_detections === 0 && s.jailbreak_attempts === 0 && s.toxicity_detections === 0 && s.blocked_prompts === 0).length / stats.totalSessions * 100) || 0) : 0) * 5.024} 502.4`}
+                            strokeLinecap="round"
+                            transform="rotate(-90 100 100)"
+                          />
+                        </svg>
+                        <div className="health-score-value">
+                          {stats.totalSessions > 0 ? ((sessions.filter(s => s.pii_detections === 0 && s.jailbreak_attempts === 0 && s.toxicity_detections === 0 && s.blocked_prompts === 0).length / stats.totalSessions * 100) || 0).toFixed(0) : 0}%
+                        </div>
+                      </div>
+                      <div className="health-score-info">
+                        <div className="health-score-title">Overall Security Health</div>
+                        <div className="health-score-description">
+                          Based on the percentage of clean sessions without any detected threats
+                        </div>
+                        <div className="health-score-rating">
+                          {(() => {
+                            const score = stats.totalSessions > 0 ? ((sessions.filter(s => s.pii_detections === 0 && s.jailbreak_attempts === 0 && s.toxicity_detections === 0 && s.blocked_prompts === 0).length / stats.totalSessions * 100) || 0) : 0;
+                            if (score >= 80) return '🌟 Excellent - Strong security posture';
+                            if (score >= 60) return '✅ Good - Acceptable security level';
+                            if (score >= 40) return '⚠️ Fair - Needs improvement';
+                            return '🚨 Poor - Immediate attention required';
+                          })()}
+                        </div>
+                      </div>
+                    </div>
                   </div>
                 </div>
               </>
