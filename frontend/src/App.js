@@ -1,5 +1,5 @@
 import React from 'react';
-   import AnalyticsDashboard from './components/AnalyticsDashboard';
+   import AnalyticsDashboard from './components/AnalyticsDashboard.refactored';
 
    function App() {
      return (

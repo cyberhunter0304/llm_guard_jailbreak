@@ -9,9 +9,20 @@ from pathlib import Path
 SECURITY_STORAGE_DIR = Path("security_logs")
 SECURITY_STORAGE_DIR.mkdir(exist_ok=True)
 
-# OpenRouter Configuration
+# LLM Provider Configuration
+# Choose provider: "openrouter" or "azure"
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "openrouter")
+
+# OpenRouter Configuration (Legacy)
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+
+# Azure AI Foundry Configuration
+AZURE_ENDPOINT = os.getenv("AZURE_ENDPOINT", "")  # e.g., https://llm-guard-foundry.openai.azure.com/
+AZURE_API_KEY = os.getenv("AZURE_API_KEY", "")
+AZURE_DEPLOYMENT = os.getenv("AZURE_DEPLOYMENT", "gpt-4-turbo")  # Deployment name
+AZURE_PROJECT_ID = os.getenv("AZURE_PROJECT_ID", "")
+AZURE_CONNECTION_STRING = os.getenv("AZURE_CONNECTION_STRING", "")
 
 # CORS Configuration
 ALLOWED_ORIGINS = [
