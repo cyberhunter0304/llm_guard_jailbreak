@@ -33,7 +33,8 @@ ALLOWED_ORIGINS = [
     "http://localhost:3001",
     "http://127.0.0.1:3001",
     "http://192.168.68.111:3001",
-    "http://192.168.68.111:3000"
+    "http://192.168.68.111:3000",
+    "*"  # Allow all origins for development
 ]
 
 # Scanner Configuration

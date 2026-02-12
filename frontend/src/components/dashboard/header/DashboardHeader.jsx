@@ -2,41 +2,47 @@ import React, { memo } from 'react';
 import logo from '../../loco.png';
 
 /**
- * DashboardHeader Component - Main header with title and key stats
+ * DashboardHeader Component - Clean minimal design
+ * Logo outside orange box on the left, same height as title container
  * Memoized for performance optimization
  */
 const DashboardHeader = memo(({ stats, isIndexingPrompts }) => {
   return (
-    <div className="dashboard-header">
-      <div className="header-content">
-        <div className="dashboard-title">
-          <div className="app-logo">
-            <img src={logo} alt="iNextLabs" />
+    <div style={{ 
+      display: 'flex', 
+      alignItems: 'stretch',
+      gap: '1.5rem',
+      marginBottom: '2rem'
+    }}>
+      {/* Logo - Same height as title container */}
+      <div style={{
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        maxHeight: '120px'
+      }}>
+        <img 
+          src={logo} 
+          alt="iNextLabs" 
+          style={{ 
+            height: 'auto',
+            maxHeight: '100px',
+            width: 'auto',
+            display: 'block',
+            objectFit: 'contain'
+          }} 
+        />
+      </div>
+
+      {/* Main Header Section - Orange box with title only */}
+      <div className="dashboard-header" style={{ flex: 1 }}>
+        <div className="header-content">
+          <div className="dashboard-title">
+            <span>inFlow Shield</span>
           </div>
-          <span>inFlow Shield</span>
-        </div>
-        <div className="dashboard-subtitle">
-          Real-time monitoring of AI security guardrails and threat detection
-        </div>
-        <div className="header-stats">
-          <div className="header-stat">
-            <div className="header-stat-value">{stats.totalSessions.toLocaleString()}</div>
-            <div className="header-stat-label">Active Sessions</div>
+          <div className="dashboard-subtitle">
+            Real-time monitoring of AI security guardrails and threat detection
           </div>
-          <div className="header-stat">
-            <div className="header-stat-value">{stats.totalPrompts.toLocaleString()}</div>
-            <div className="header-stat-label">Total Prompts</div>
-          </div>
-          <div className="header-stat">
-            <div className="header-stat-value">{stats.totalBlocked.toLocaleString()}</div>
-            <div className="header-stat-label">Blocked Threats</div>
-          </div>
-          {isIndexingPrompts && (
-            <div className="header-stat">
-              <div className="header-stat-value">⏳</div>
-              <div className="header-stat-label">Indexing Prompts...</div>
-            </div>
-          )}
         </div>
       </div>
     </div>

@@ -4,6 +4,7 @@ import { StatsGrid } from './dashboard/stats/StatCard.jsx';
 import { SearchBox, FilterGroup, SortDropdown, ActionButtons } from './dashboard/filters/FilterControls.jsx';
 import ExportMenu from './dashboard/filters/ExportMenu.jsx';
 import { SessionsTable } from './dashboard/sessions/SessionsTable.jsx';
+import PaginationControls from './dashboard/pagination/PaginationControls.jsx';
 import {
   ThreatDistributionChart,
   TimelineChart,
@@ -32,7 +33,8 @@ import dashboardStyles from './dashboard/styles/dashboard.css';
  * Manages state and orchestrates child components
  */
 const AnalyticsDashboard = () => {
-  const BACKEND_URL = `http://${window.location.hostname}:8000`;
+  // Allow override via environment or local storage
+  const BACKEND_URL = process.env.REACT_APP_BACKEND_URL || localStorage.getItem('backendUrl') || `http://${window.location.hostname}:8000`;
 
   // Data management hooks
   const {
@@ -332,19 +334,13 @@ const AnalyticsDashboard = () => {
 
                 {/* Pagination */}
                 {totalPages > 1 && (
-                  <div style={{ marginTop: '20px', textAlign: 'center' }}>
-                    <button onClick={() => paginate(currentPage - 1)} disabled={currentPage === 1}>←</button>
-                    {[...Array(totalPages)].map((_, i) => (
-                      <button 
-                        key={i + 1} 
-                        onClick={() => paginate(i + 1)}
-                        style={{ fontWeight: currentPage === i + 1 ? 'bold' : 'normal' }}
-                      >
-                        {i + 1}
-                      </button>
-                    ))}
-                    <button onClick={() => paginate(currentPage + 1)} disabled={currentPage === totalPages}>→</button>
-                  </div>
+                  <PaginationControls
+                    currentPage={currentPage}
+                    totalPages={totalPages}
+                    onPageChange={paginate}
+                    itemsPerPage={20}
+                    totalItems={filteredSessions.length}
+                  />
                 )}
               </>
             )}
@@ -384,7 +380,7 @@ const AnalyticsDashboard = () => {
             )}
 
             {/* Details View */}
-            {view === 'details' && botDetails && (
+           {view === 'details' && botDetails && (
               <div className="details-container">
                 <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 20 }}>
                   <button className="back-btn" onClick={() => setView('overview')}>
@@ -429,86 +425,112 @@ const AnalyticsDashboard = () => {
                 </div>
 
                 {detailsTab === 'events' ? (
-                  <div className="events-list">
-                    {botDetails.security_events?.map((event, idx) => (
-                      <div key={idx} className="event-card">
-                        <div className="event-header">
-                          <div className="event-timestamp">🕐 {formatDate(event.timestamp)}</div>
-                          <div className={`event-status ${event.blocked ? 'blocked' : 'safe'}`}>
-                            {event.blocked ? '🚫 BLOCKED' : '✅ SAFE'}
-                          </div>
-                          <div className="event-risk">
-                            Risk: <span className={`risk-${event.risk_level.toLowerCase()}`}>{event.risk_level}</span>
-                          </div>
-                        </div>
-                        
-                        <div className="event-content">
-                          <div className="event-section">
-                            <div className="event-section-title">📝 Prompt</div>
-                            <div className="event-text">{event.prompt}</div>
-                          </div>
+  <div className="events-list">
+    {botDetails.security_events?.map((event, idx) => {
+      // Determine event card background color based on threat type
+      let bgColor = '#d4edda'; // Default green for safe
+      let borderColor = '#28a745'; // Green border
+      
+      // Check if PII is detected (Yellow - highest priority)
+      if (event.detections?.pii?.detected || 
+          event.detections?.['pii-presidio']?.detected ||
+          event.detections?.['pii-scanner']?.detected) {
+        bgColor = '#fff3cd'; // Yellow background
+        borderColor = '#ffc107'; // Yellow border
+      }
+      // Check if blocked - jailbreak, prompt_injection, toxicity (Red)
+      else if (event.blocked) {
+        bgColor = '#f8d7da'; // Red background
+        borderColor = '#dc3545'; // Red border
+      }
+      
+      return (
+        <div 
+          key={idx} 
+          className="event-card"
+          style={{ 
+            backgroundColor: bgColor, 
+            borderLeft: `4px solid ${borderColor}`
+          }}
+        >
+          <div className="event-header">
+            <div className="event-timestamp">🕐 {formatDate(event.timestamp)}</div>
+            <div className={`event-status ${event.blocked ? 'blocked' : 'safe'}`}>
+              {event.blocked ? '🚫 BLOCKED' : '✅ SAFE'}
+            </div>
+            <div className="event-risk">
+              Risk: <span className={`risk-${event.risk_level.toLowerCase()}`}>{event.risk_level}</span>
+            </div>
+          </div>
+          
+          <div className="event-content">
+            <div className="event-section">
+              <div className="event-section-title">📝 Prompt</div>
+              <div className="event-text">{event.prompt}</div>
+            </div>
 
-                          {/* Only show detected threats */}
-                          {event.detections && Object.entries(event.detections).filter(([, result]) => result.detected).length > 0 && (
-                            <div className="event-section">
-                              <div className="event-section-title">🔍 Detected Threats</div>
-                              <div className="detections-grid">
-                                {Object.entries(event.detections).map(([scannerName, result]) => 
-                                  result.detected && (
-                                    <div key={scannerName} className="detection-badge threat">
-                                      <div className="detection-name">{scannerName}</div>
-                                      <div className="detection-status">⚠️ DETECTED</div>
-                                      {result.entities_found && <div className="detection-count">{result.entities_found} entities</div>}
-                                    </div>
-                                  )
-                                )}
-                              </div>
-                            </div>
-                          )}
-
-                          {/* Block Reason (if blocked) */}
-                          {event.blocked && event.block_reason && (
-                            <div className="event-section">
-                              <div className="event-section-title">� Block Reason</div>
-                              <div className="block-reason">{event.block_reason}</div>
-                            </div>
-                          )}
-
-                          {/* LLM Response (if not blocked) */}
-                          {!event.blocked && event.llm_response && (
-                            <div className="event-section">
-                              <div className="event-section-title">💬 LLM Response</div>
-                              <div className="llm-response">{event.llm_response}</div>
-                            </div>
-                          )}
-
-                          {/* Metrics */}
-                          <div className="event-section">
-                            <div className="event-section-title">⏱️ Performance</div>
-                            <div className="metrics-grid">
-                              <div className="metric-box">
-                                <div className="metric-label">Scan Time</div>
-                                <div className="metric-value">{event.metrics?.scan_time?.toFixed(3) || event.scan_duration?.toFixed(3)}s</div>
-                              </div>
-                              {!event.blocked && event.metrics?.llm_time && (
-                                <div className="metric-box">
-                                  <div className="metric-label">LLM Time</div>
-                                  <div className="metric-value">{event.metrics.llm_time.toFixed(3)}s</div>
-                                </div>
-                              )}
-                              {event.metrics?.total_time && (
-                                <div className="metric-box">
-                                  <div className="metric-label">Total Time</div>
-                                  <div className="metric-value">{event.metrics.total_time.toFixed(3)}s</div>
-                                </div>
-                              )}
-                            </div>
-                          </div>
-                        </div>
+            {/* Only show detected threats */}
+            {event.detections && Object.entries(event.detections).filter(([, result]) => result.detected).length > 0 && (
+              <div className="event-section">
+                <div className="event-section-title">🔍 Detected Threats</div>
+                <div className="detections-grid">
+                  {Object.entries(event.detections).map(([scannerName, result]) => 
+                    result.detected && (
+                      <div key={scannerName} className="detection-badge threat">
+                        <div className="detection-name">{scannerName}</div>
+                        <div className="detection-status">⚠️ DETECTED</div>
+                        {result.entities_found && <div className="detection-count">{result.entities_found} entities</div>}
                       </div>
-                    ))}
+                    )
+                  )}
+                </div>
+              </div>
+            )}
+
+            {/* Block Reason (if blocked) */}
+            {event.blocked && event.block_reason && (
+              <div className="event-section">
+                <div className="event-section-title">🛡️ Block Reason</div>
+                <div className="block-reason">{event.block_reason}</div>
+              </div>
+            )}
+
+            {/* LLM Response (if not blocked) */}
+            {!event.blocked && event.llm_response && (
+              <div className="event-section">
+                <div className="event-section-title">💬 LLM Response</div>
+                <div className="llm-response">{event.llm_response}</div>
+              </div>
+            )}
+
+            {/* Metrics */}
+            <div className="event-section">
+              <div className="event-section-title">⏱️ Performance</div>
+              <div className="metrics-grid">
+                <div className="metric-box">
+                  <div className="metric-label">Scan Time</div>
+                  <div className="metric-value">{event.metrics?.scan_time?.toFixed(3) || event.scan_duration?.toFixed(3)}s</div>
+                </div>
+                {!event.blocked && event.metrics?.llm_time && (
+                  <div className="metric-box">
+                    <div className="metric-label">LLM Time</div>
+                    <div className="metric-value">{event.metrics.llm_time.toFixed(3)}s</div>
                   </div>
-                ) : (
+                )}
+                {event.metrics?.total_time && (
+                  <div className="metric-box">
+                    <div className="metric-label">Total Time</div>
+                    <div className="metric-value">{event.metrics.total_time.toFixed(3)}s</div>
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        </div>
+      );
+    })}
+  </div>
+) : (
                   <div className="pii-details">
                     <div className="section-title">🔒 PII Entities ({extractPIIData(botDetails).length})</div>
                     {extractPIIData(botDetails).length === 0 ? (
