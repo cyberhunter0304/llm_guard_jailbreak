@@ -24,6 +24,32 @@ export interface Session {
   secrets_detections?: number;
 }
 
+export interface Thread {
+  thread_id: string;
+  user_id: string;
+  conversation_count: number;
+  total_prompts: number;
+  created_at: string;
+  last_updated?: string;
+  pii_detections: number;
+  jailbreak_attempts: number;
+  toxicity_detections: number;
+  secrets_detections?: number;
+  blocked_prompts?: number;
+}
+
+export interface ThreadItemData {
+  id: string;
+  type?: string;
+  preview?: string;
+  prompt?: string;
+  response?: string;
+  blocked_reason?: string;
+  timestamp: string;
+  threats?: string[];
+  detections?: DetectionResult;
+}
+
 export interface SecurityMetrics {
   total_time: number;
   scan_time: number;

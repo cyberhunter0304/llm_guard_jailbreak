@@ -51,7 +51,11 @@ export {
 export {
   ThreatBadge,
   SessionRow,
-  SessionsTable
+  SessionsTable,
+  ThreadItem,
+  ThreadsList,
+  CollapsibleItem,
+  ThreadDetailView
 } from './sessions/SessionsTable.jsx';
 
 // Styles

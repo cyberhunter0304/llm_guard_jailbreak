@@ -5,7 +5,14 @@ Centralized configuration for the Guardrail Cloud Service
 import os
 from pathlib import Path
 
-# Security Storage
+# MongoDB Configuration
+MONGODB_URI = os.getenv("MONGODB_URI", "mongodb://localhost:27017/")
+MONGODB_DATABASE = os.getenv("MONGODB_DATABASE", "guardrails_dev")
+MONGODB_SECURITY_LOGS_COLLECTION = "security_logs"  # Individual security events
+MONGODB_CONVERSATIONS_COLLECTION = "conversations"
+MONGODB_THREAD_SUMMARIES_COLLECTION = "thread_summaries"  # Aggregated thread data
+
+# Security Storage (Deprecated - using MongoDB now)
 SECURITY_STORAGE_DIR = Path("security_logs")
 SECURITY_STORAGE_DIR.mkdir(exist_ok=True)
 

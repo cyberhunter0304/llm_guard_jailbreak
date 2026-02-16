@@ -16,10 +16,7 @@
     "eject": "react-scripts eject"
   },
   "devDependencies": {
-    "autoprefixer": "^10.4.23",
-    "postcss": "^8.5.6",
-    "react-scripts": "5.0.1",
-    "tailwindcss": "^4.1.18"
+    "react-scripts": "5.0.1"
   },
   "browserslist": {
     "production": [
