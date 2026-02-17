@@ -111,7 +111,8 @@ body {
   margin-bottom: 1.5rem;
 }
 
-.toggle-btn {
+.toggle-btn,
+.view-btn {
   padding: 0.75rem 1.5rem;
   border: none;
   border-radius: 0.5rem;
@@ -124,14 +125,19 @@ body {
   color: #a8a29e;
   box-shadow: 0 1px 3px rgba(0,0,0,0.08);
   border: 1px solid #fde68a;
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
 }
 
-.toggle-btn:hover {
+.toggle-btn:hover,
+.view-btn:hover {
   transform: translateY(-2px);
   box-shadow: 0 4px 12px rgba(249,115,22,0.15);
+  border-color: #fdba74;
+  color: #f97316;
 }
 
-.toggle-btn.active {
+.toggle-btn.active,
+.view-btn.active {
   background: linear-gradient(135deg, #f97316 0%, #ea580c 100%);
   color: white;
   border-color: transparent;
@@ -797,6 +803,56 @@ body {
 
 .event-status.safe {
   background: linear-gradient(135deg, #16a34a 0%, #15803d 100%);
+}
+
+/* Event Number Badge */
+.event-number {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 1.75rem;
+  height: 1.75rem;
+  padding: 0 0.375rem;
+  background: linear-gradient(135deg, rgba(249,115,22,0.12) 0%, rgba(234,88,12,0.12) 100%);
+  color: #9a3412;
+  border-radius: 0.375rem;
+  font-size: 0.75rem;
+  font-weight: 700;
+  letter-spacing: -0.025em;
+  flex-shrink: 0;
+}
+
+/* Risk Badge */
+.risk-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.25rem 0.625rem;
+  border-radius: 0.375rem;
+  font-size: 0.6875rem;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.risk-badge.risk-critical,
+.risk-badge.risk-high {
+  background: linear-gradient(135deg, rgba(220,38,38,0.12) 0%, rgba(185,28,28,0.12) 100%);
+  color: #b91c1c;
+  border: 1px solid rgba(220,38,38,0.25);
+}
+
+.risk-badge.risk-medium {
+  background: linear-gradient(135deg, rgba(245,158,11,0.12) 0%, rgba(217,119,6,0.12) 100%);
+  color: #b45309;
+  border: 1px solid rgba(245,158,11,0.25);
+}
+
+.risk-badge.risk-low,
+.risk-badge.risk-safe {
+  background: linear-gradient(135deg, rgba(22,163,74,0.12) 0%, rgba(21,128,61,0.12) 100%);
+  color: #15803d;
+  border: 1px solid rgba(22,163,74,0.25);
 }
 
 .event-content {
