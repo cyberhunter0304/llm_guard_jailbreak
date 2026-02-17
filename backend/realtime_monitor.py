@@ -31,7 +31,7 @@ import json
 import time
 from typing import AsyncGenerator, Dict, Any, Optional
 from pymongo import MongoClient
-from pymongo.errors import ServerSelectionTimeoutError, PyMongoError, OperationFailure
+from pymongo.errors import ServerSelectionTimeoutError, PyMongoError
 from pathlib import Path
 
 from config import (
@@ -90,21 +90,25 @@ def _extract_message_data(doc: Dict) -> Optional[Dict[str, Any]]:
 
     Returns None if the document is missing critical identifiers.
 
-    HOW TO ADD SUPPORT FOR A NEW BOT / CHANNEL:
-    Add extra field-name fallbacks here if a new bot uses different key names.
-    Everything else (scan logic, storage) stays the same.
+    threadId is OPTIONAL — if missing we fall back to conversationId.
+    Only botId + conversationId are truly required.
     """
     bot_id          = doc.get("botId")          or doc.get("bot_id")
-    thread_id       = doc.get("threadId")       or doc.get("thread_id")
     conversation_id = doc.get("conversationId") or doc.get("conversation_id")
     message_id      = doc.get("messageId")      or doc.get("message_id")
 
-    if not bot_id or not thread_id or not conversation_id:
-        # Log the actual keys present so we can see what's missing
+    # threadId is optional — fall back to conversationId if not present
+    thread_id = (
+        doc.get("threadId")
+        or doc.get("thread_id")
+        or conversation_id   # ← fallback for external bots that don't send threadId
+    )
+
+    if not bot_id or not conversation_id:
         present_keys = list(doc.keys())
         logger.warning(
             f"Skipping doc — missing required fields. "
-            f"botId={bot_id!r}, threadId={thread_id!r}, conversationId={conversation_id!r}. "
+            f"botId={bot_id!r}, conversationId={conversation_id!r}. "
             f"Keys in doc: {present_keys}"
         )
         return None
@@ -412,151 +416,72 @@ class ConversationMonitor:
 
     async def run_forever(self) -> None:
         """
-        Infinite loop started as an asyncio Task by the FastAPI startup event.
+        Polling loop — checks MongoDB every 10 seconds for new user messages.
 
-        - Connects to MongoDB
-        - Opens Change Stream (resumes from saved token if available)
-        - Processes every new message document
-        - Auto-reconnects on any network/MongoDB failure
-        - Never exits unless the process itself is killed
+        MongoDB is READ-ONLY — this loop never writes anything back to it.
+        Deduplication is handled entirely by the local security_logs JSON files
+        via processed_message_ids (see storage.py → is_message_processed()).
+
+        Only processes messages created AFTER this server started, so existing
+        data in the company DB is never touched.
         """
-        logger.info("Monitor background task started")
+        logger.info("Monitor polling loop started (interval: 10s)")
+        POLL_INTERVAL = 10
 
-        while True:                              # outer reconnect loop
-            if not self.connect():
-                logger.warning("Retrying MongoDB connection in 10 s...")
-                await asyncio.sleep(10)
-                continue
+        # Only look at docs created after this server started
+        startup_time = now()
+        logger.info(f"[poll] Will only scan messages created after: {startup_time}")
 
-            collection   = self.db[MONGODB_CONVERSATIONS_COLLECTION]
-            resume_token = _load_resume_token()
-            pipeline     = [{"$match": {"operationType": "insert"}}]
+        while True:
+            # Ensure DB connection
+            if self.db is None:
+                if not self.connect():
+                    logger.warning("MongoDB not available — retrying in 10 s...")
+                    await asyncio.sleep(POLL_INTERVAL)
+                    continue
 
             self.running = True
-            self._broadcast({
-                "event": "started",
-                "data": {
-                    "message":    "Monitor running",
-                    "collection": MONGODB_CONVERSATIONS_COLLECTION,
-                    "resumed":    resume_token is not None,
-                    "timestamp":  now(),
-                },
-            })
 
             try:
-                watch_kwargs = {"full_document": "updateLookup"}
-                if resume_token:
-                    watch_kwargs["resume_after"] = resume_token
+                collection = self.db[MONGODB_CONVERSATIONS_COLLECTION]
 
-                with collection.watch(pipeline, **watch_kwargs) as stream:
-                    logger.info("Change Stream open — waiting for new messages...")
-                    last_stats_ts = time.time()
+                # READ ONLY — no processed filter needed, dedup handled by local JSON
+                # Only new messages (after server start), only user turns
+                new_messages = list(collection.find({
+                    "from.role": "user",
+                    "createdAt": {"$gte": startup_time},
+                }).limit(100))
 
-                    while self.running:
-                        change = stream.try_next()
+                if new_messages:
+                    logger.info(f"[poll] Found {len(new_messages)} new message(s) — checking...")
 
-                        if change is not None:
-                            # Save token first — so a crash right after
-                            # still advances our position on next restart
-                            _save_resume_token(stream.resume_token)
+                for doc in new_messages:
+                    try:
+                        # process_message() calls is_message_processed() internally
+                        # — already-scanned docs are skipped via local JSON dedup,
+                        # no MongoDB write needed
+                        result = self.process_message(doc)
+                        msg_id = result.get("message_id") or doc.get("messageId")
 
-                            doc          = change.get("fullDocument") or {}
-                            preview_role = doc.get("from", {}).get("role", "")
+                        if not result.get("skipped") and result.get("success"):
+                            self._broadcast({"event": "processed", "data": {**result, "timestamp": now()}})
+                            logger.info(f"[poll] ✅ Scanned and saved: {msg_id}")
 
-                            if preview_role == "user":
-                                self._broadcast({
-                                    "event": "processing",
-                                    "data": {
-                                        "bot_id":          doc.get("botId", "unknown"),
-                                        "conversation_id": doc.get("conversationId", "unknown"),
-                                        "message_id":      doc.get("messageId", "unknown"),
-                                        "timestamp":       now(),
-                                    },
-                                })
+                        # No MongoDB writes at all — ever
 
-                            result = self.process_message(doc)
+                    except Exception as exc:
+                        logger.error(f"[poll] Error on {doc.get('messageId')}: {exc}")
+                        self.error_count += 1
 
-                            if not result.get("skipped"):
-                                event_name = "processed" if result.get("success") else "error"
-                                self._broadcast({
-                                    "event": event_name,
-                                    "data":  {**result, "timestamp": now()},
-                                })
-
-                        # Heartbeat stats every 30 s
-                        if time.time() - last_stats_ts >= 30:
-                            last_stats_ts = time.time()
-                            self._broadcast({
-                                "event": "stats",
-                                "data": {
-                                    "processed_count": self.processed_count,
-                                    "skipped_count":   self.skipped_count,
-                                    "error_count":     self.error_count,
-                                    "timestamp":       now(),
-                                },
-                            })
-
-                        await asyncio.sleep(0.1)      # yield to event loop
-
-            except OperationFailure as e:
-                # Error code 40573 = Change Stream requires replica set or sharded cluster
-                # Error code 286   = ChangeStreamHistoryLost (stale resume token)
-                if e.code == 40573:
-                    logger.error(
-                        "Change Streams are NOT supported on this MongoDB deployment. "
-                        "Your MongoDB must be a Replica Set or Atlas cluster. "
-                        "A standalone mongod does NOT support Change Streams. "
-                        "Retrying in 60 s — fix your MongoDB deployment to resolve this."
-                    )
-                    self._broadcast({"event": "error", "data": {
-                        "message": "Change Streams require a MongoDB Replica Set or Atlas cluster.",
-                        "code": e.code,
-                        "timestamp": now(),
-                    }})
-                    self.running = False
-                    self.disconnect()
-                    await asyncio.sleep(60)
-                elif e.code in (286, 136):  # ChangeStreamHistoryLost / CappedPositionLost
-                    logger.warning(
-                        f"Resume token is stale (oplog rolled past it). "
-                        f"Clearing token and restarting from NOW. "
-                        f"Any messages inserted while the server was down will NOT be re-processed. "
-                        f"Error: {e}"
-                    )
-                    # Wipe the bad token so next iteration opens a fresh stream
-                    if RESUME_TOKEN_FILE.exists():
-                        RESUME_TOKEN_FILE.unlink()
-                    resume_token = None
-                    self._broadcast({"event": "error", "data": {
-                        "message": "Stale resume token cleared — restarting stream from current position.",
-                        "timestamp": now(),
-                    }})
-                    self.running = False
-                    self.disconnect()
-                    await asyncio.sleep(2)
-                else:
-                    logger.error(f"MongoDB OperationFailure (code {e.code}): {e} — reconnecting in 5 s...")
-                    self._broadcast({"event": "error",
-                                      "data": {"message": str(e), "timestamp": now()}})
-                    self.running = False
-                    self.disconnect()
-                    await asyncio.sleep(5)
-
-            except PyMongoError as e:
-                logger.error(f"Change Stream lost: {e} — reconnecting in 5 s...")
-                self._broadcast({"event": "error",
-                                  "data": {"message": str(e), "timestamp": now()}})
+            except PyMongoError as exc:
+                logger.error(f"[poll] MongoDB error: {exc} — reconnecting...")
                 self.running = False
                 self.disconnect()
-                await asyncio.sleep(5)
 
-            except Exception as e:
-                logger.error(f"Unexpected monitor error: {e} — reconnecting in 5 s...")
-                self._broadcast({"event": "error",
-                                  "data": {"message": str(e), "timestamp": now()}})
-                self.running = False
-                self.disconnect()
-                await asyncio.sleep(5)
+            except Exception as exc:
+                logger.error(f"[poll] Unexpected error: {exc}")
+
+            await asyncio.sleep(POLL_INTERVAL)
 
     # ------------------------------------------------------------------
     # SSE stream — one per connected frontend tab
@@ -605,7 +530,7 @@ class ConversationMonitor:
         if isinstance(doc_id_or_doc, str):
             # Fetch the real doc from MongoDB by _id
             from bson import ObjectId
-            if not self.db:
+            if self.db is None:
                 self.connect()
             collection = self.db[MONGODB_CONVERSATIONS_COLLECTION]
             doc = collection.find_one({"_id": ObjectId(doc_id_or_doc)})

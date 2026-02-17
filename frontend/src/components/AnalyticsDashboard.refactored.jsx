@@ -110,66 +110,76 @@ const AnalyticsDashboard = () => {
     return aggregated;
   }, [normalizedThreads]);
 
-  // Transform MongoDB message structure to security_events structure
-  const transformConversationData = (conversation) => {
-    if (!conversation.messages || conversation.messages.length === 0) {
-      console.log(`Conversation ${conversation.conversation_id} has no messages`);
-      return { ...conversation, security_events: [] };
-    }
-
-    // Convert messages array to security_events array
-    // Only include user messages that have validation data
-    const security_events = conversation.messages
-      .filter(msg => {
-        const isUserMessage = msg.role === 'user';
-        const hasValidation = msg.validation != null;
-        return isUserMessage && hasValidation;
-      })
-      .map(msg => ({
-        timestamp: msg.timestamp || msg.validation?.timestamp,
-        prompt: msg.text || msg.validation?.prompt,
-        prompt_length: msg.validation?.prompt_length || (msg.text?.length || 0),
-        llm_response: msg.validation?.llm_response,
-        detections: msg.validation?.detections || {},
-        risk_level: msg.validation?.risk_level || 'SAFE',
-        is_safe: msg.validation?.is_safe !== false,
-        blocked: msg.validation?.blocked || false,
-        block_reason: msg.validation?.message,
-        metrics: msg.validation?.metrics || {},
-        anonymized_prompt: msg.validation?.detections?.pii?.anonymized_prompt
-      }));
-
-    console.log(`Conversation ${conversation.conversation_id}: ${conversation.messages.length} messages → ${security_events.length} security events`);
-
-    return {
-      ...conversation,
-      security_events
-    };
-  };
-
-  // Fetch all threads from backend
+  // Fetch all threads from backend.
+  // /api/security reads local security_logs/*.json (one file per bot_id).
+  // Each file is a flat bot log: { bot_id, security_events[], total_prompts, ... }
+  // We map it into the thread shape the UI expects.
   const fetchAllThreads = useCallback(async () => {
     try {
       setLoading(true);
-      // Use /api/security endpoint which reads from security_logs collection
       const response = await fetch(`${BACKEND_URL}/api/security`);
       const data = await response.json();
-      
-      // Transform the data structure to match UI expectations
-      const transformedThreads = (data.sessions || []).map(thread => {
-        if (!thread.conversations) {
-          return thread;
-        }
-        
-        // Transform each conversation's messages to security_events
-        const transformedConversations = thread.conversations.map(transformConversationData);
-        
+
+      const transformedThreads = (data.sessions || []).map(botLog => {
+        const events = botLog.security_events || [];
+
+        // Group security_events by conversation_id
+        const convMap = {};
+        events.forEach(evt => {
+          const convId = evt.conversation_id || 'unknown';
+          if (!convMap[convId]) {
+            convMap[convId] = {
+              conversation_id:     convId,
+              thread_id:           evt.thread_id || botLog.bot_id,
+              started_at:          evt.timestamp,
+              ended_at:            evt.timestamp,
+              security_events:     [],
+              total_prompts:       0,
+              blocked_prompts:     0,
+              pii_detections:      0,
+              jailbreak_attempts:  0,
+              toxicity_detections: 0,
+              secrets_detections:  0,
+            };
+          }
+          const conv = convMap[convId];
+
+          if (evt.timestamp < conv.started_at) conv.started_at = evt.timestamp;
+          if (evt.timestamp > conv.ended_at)   conv.ended_at   = evt.timestamp;
+
+          conv.security_events.push(evt);
+          conv.total_prompts += 1;
+          if (evt.blocked)                                 conv.blocked_prompts     += 1;
+          if (evt.detections?.pii?.detected)               conv.pii_detections      += 1;
+          if (evt.detections?.prompt_injection?.detected)  conv.jailbreak_attempts  += 1;
+          if (evt.detections?.toxicity?.detected)          conv.toxicity_detections += 1;
+          if (evt.detections?.pii?.secrets_detected)       conv.secrets_detections  += 1;
+        });
+
+        const conversations = Object.values(convMap);
+        const threadId = events[0]?.thread_id || botLog.bot_id;
+        const userId   = events[0]?.thread_id
+          ? `user_${events[0].thread_id.replace(/^thread_/, '')}`
+          : botLog.bot_id;
+
         return {
-          ...thread,
-          conversations: transformedConversations
+          thread_id:           threadId,
+          bot_id:              botLog.bot_id,
+          user_id:             userId,
+          created_at:          botLog.created_at,
+          last_updated:        botLog.last_updated,
+          total_prompts:       botLog.total_prompts       || 0,
+          blocked_prompts:     botLog.blocked_prompts     || 0,
+          pii_detections:      botLog.pii_detections      || 0,
+          jailbreak_attempts:  botLog.jailbreak_attempts  || 0,
+          toxicity_detections: botLog.toxicity_detections || 0,
+          secrets_detections:  botLog.secrets_detections  || 0,
+          conversations,
+          total_conversations: conversations.length,
+          conversation_count:  conversations.length,
         };
       });
-      
+
       setThreads(transformedThreads);
       setLoading(false);
     } catch (error) {

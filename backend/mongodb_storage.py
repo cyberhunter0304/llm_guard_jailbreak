@@ -1,398 +1,505 @@
 """
 MongoDB Storage Module
-Thread-safe MongoDB operations for security logs
-Replaces file-based JSON storage with MongoDB backend
+======================
+Handles ALL MongoDB read/write operations.
+
+Responsibilities
+----------------
+- Connect / disconnect MongoDB
+- save_conversation()       — write one message doc to the conversations collection
+- fetch_conversations()     — THE single shared helper for ALL conversation reads
+- insert_test_message()     — write a test-chat message so the monitor picks it up
+- get_unprocessed_conversations() / mark_conversation_processed()  — batch helpers
+- get_processing_stats()    — stats for the batch endpoints
+
+Security-log operations (load / save / delete / list) now write to
+LOCAL JSON FILES via storage.py, NOT MongoDB.  Do NOT add MongoDB security-log
+writes here.
 """
+
 import logging
+import time
 from typing import Dict, List, Optional, Any
-from datetime import datetime
-from pymongo import MongoClient
-from pymongo.errors import ServerSelectionTimeoutError, DuplicateKeyError
+
+from bson import ObjectId
+from pymongo import MongoClient, DESCENDING, ASCENDING
+from pymongo.errors import ServerSelectionTimeoutError
+
 from config import (
-    MONGODB_URI, 
-    MONGODB_DATABASE, 
-    MONGODB_SECURITY_LOGS_COLLECTION,
-    MONGODB_CONVERSATIONS_COLLECTION
+    MONGODB_URI,
+    MONGODB_DATABASE,
+    MONGODB_CONVERSATIONS_COLLECTION,
 )
 from datetime_utils import now
 
 logger = logging.getLogger(__name__)
 
-# Global MongoDB client and database
+# ---------------------------------------------------------------------------
+# Global connection state
+# ---------------------------------------------------------------------------
+
 _client: Optional[MongoClient] = None
 _db = None
 
 
-def connect_mongodb():
-    """Initialize MongoDB connection"""
+# ---------------------------------------------------------------------------
+# Connection helpers
+# ---------------------------------------------------------------------------
+
+def connect_mongodb() -> bool:
+    """Initialise the shared MongoDB connection. Returns True on success."""
     global _client, _db
-    
     try:
         _client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
-        # Test the connection
-        _client.admin.command('ping')
+        _client.admin.command("ping")
         _db = _client[MONGODB_DATABASE]
-        
-        # Create collections with indexes if they don't exist
-        _create_indexes()
-        
-        logger.info(f"✅ Connected to MongoDB - Database: {MONGODB_DATABASE}")
-        return True
+        logger.info(f"✅ Connected to MongoDB — database: {MONGODB_DATABASE}")
     except ServerSelectionTimeoutError:
-        logger.error(f"❌ Failed to connect to MongoDB at {MONGODB_URI}")
+        logger.error(f"❌ Could not reach MongoDB at {MONGODB_URI}")
         return False
-    except Exception as e:
-        logger.error(f"❌ MongoDB connection error: {str(e)}")
+    except Exception as exc:
+        logger.error(f"❌ MongoDB connection error: {exc}")
         return False
 
+    # Index setup is best-effort — a failure here must NOT prevent the server
+    # from starting.  All index errors are logged as warnings, not exceptions.
+    try:
+        _create_indexes()
+    except Exception as exc:
+        logger.warning(f"⚠️  Index setup failed (non-fatal): {exc}")
 
-def _create_indexes():
-    """Create necessary MongoDB indexes"""
-    if _db is None:
-        return
-    
-    security_logs = _db[MONGODB_SECURITY_LOGS_COLLECTION]
-    conversations = _db[MONGODB_CONVERSATIONS_COLLECTION]
-    
-    # Index on bot_id for fast lookups
-    security_logs.create_index("bot_id", unique=True)
-    security_logs.create_index("created_at")
-    security_logs.create_index("last_updated")
-    
-    # Index on conversation_id and bot_id in conversations
-    conversations.create_index("conversation_id", unique=True)
-    conversations.create_index("bot_id")
-    conversations.create_index("processed")
-    
-    logger.info("✅ MongoDB indexes created")
+    return True
+
+
+def close_mongodb() -> None:
+    """Close the shared MongoDB connection."""
+    global _client
+    if _client:
+        _client.close()
+        logger.info("MongoDB connection closed")
 
 
 def get_mongodb():
-    """Get MongoDB database instance"""
+    """Return the shared database instance, reconnecting if necessary."""
     global _db
     if _db is None:
         connect_mongodb()
     return _db
 
 
-def load_bot_security_log(bot_id: str) -> dict:
-    """Load security log for a bot session from MongoDB"""
+def _drop_index_if_exists(col, name: str) -> None:
+    """Drop an index by name, ignoring errors if it doesn't exist."""
     try:
-        db = get_mongodb()
-        if db is None:
-            logger.error("MongoDB not connected")
-            return _get_default_security_log(bot_id)
-        
-        security_logs = db[MONGODB_SECURITY_LOGS_COLLECTION]
-        
-        existing_log = security_logs.find_one({"bot_id": bot_id})
-        
-        if existing_log:
-            # Remove MongoDB's _id field from response
-            if "_id" in existing_log:
-                del existing_log["_id"]
-            return existing_log
-        
-        return _get_default_security_log(bot_id)
-    
+        col.drop_index(name)
+        logger.info(f"Dropped stale index: {name}")
     except Exception as e:
-        logger.error(f"Error loading security log for bot {bot_id}: {str(e)}")
-        return _get_default_security_log(bot_id)
+        logger.debug(f"Could not drop {name} (may not exist): {e}")
 
 
-def save_bot_security_log(bot_id: str, security_data: dict):
-    """Save security log for a bot session to MongoDB"""
+def _create_indexes() -> None:
+    """
+    Create necessary indexes — fully idempotent, never raises on boot.
+
+    Strategy: always drop an index before (re)creating it with different
+    options.  MongoDB raises IndexKeySpecsConflict (code 86) if you try to
+    create an index with the same name but different options, so we drop first.
+
+    Desired final state
+    -------------------
+    conversationId  — non-unique, sparse (multiple messages share one conv ID)
+    messageId       — unique, sparse     (one doc per message)
+    botId           — non-unique
+    threadId        — non-unique
+    createdAt       — non-unique descending
+    processed       — non-unique
+    """
+    if _db is None:
+        return
+
+    col = _db[MONGODB_CONVERSATIONS_COLLECTION]
+
     try:
-        db = get_mongodb()
-        if db is None:
-            logger.error("MongoDB not connected - cannot save security log")
-            return False
-        
-        security_logs = db[MONGODB_SECURITY_LOGS_COLLECTION]
-        
-        # Remove _id if present to allow update
-        if "_id" in security_data:
-            del security_data["_id"]
-        
-        # Ensure last_updated is set
-        security_data["last_updated"] = now()
-        
-        # Upsert: update if exists, insert if not
-        result = security_logs.update_one(
-            {"bot_id": bot_id},
-            {"$set": security_data},
-            upsert=True
-        )
-        
-        logger.debug(f"Saved security log for bot {bot_id}")
+        existing_indexes = list(col.list_indexes())
+        existing = {idx["name"]: idx for idx in existing_indexes}
+    except Exception as e:
+        logger.warning(f"Could not list indexes: {e}")
+        return
+
+    # ── Drop ALL stale / mismatched indexes so we can recreate cleanly ────────
+
+    # Legacy snake_case index (old schema)
+    if "conversation_id_1" in existing:
+        _drop_index_if_exists(col, "conversation_id_1")
+
+    # conversationId was previously unique — must NOT be unique
+    if "conversationId_1" in existing:
+        if existing["conversationId_1"].get("unique"):
+            _drop_index_if_exists(col, "conversationId_1")
+
+    # messageId was previously non-unique — must be unique
+    # MongoDB rejects re-creating with different options under the same name,
+    # so always drop it and let create_index rebuild it correctly.
+    if "messageId_1" in existing:
+        existing_is_unique = existing["messageId_1"].get("unique", False)
+        if not existing_is_unique:
+            # Old non-unique version — drop so we can recreate as unique
+            _drop_index_if_exists(col, "messageId_1")
+        # If already unique+sparse: leave it, create_index is a no-op
+
+    # ── Recreate indexes with correct options ─────────────────────────────────
+    index_specs = [
+        # (keys_or_field, kwargs)
+        ("conversationId",              {}),                             # lookup, NOT unique
+        ("messageId",                   {"unique": True, "sparse": True}),
+        ("botId",                       {}),
+        ("threadId",                    {}),
+        ([("createdAt", DESCENDING)],   {}),
+        ("processed",                   {}),
+    ]
+
+    for keys, kwargs in index_specs:
+        try:
+            col.create_index(keys, **kwargs)
+        except Exception as e:
+            # Log but never let an index error crash the whole startup
+            logger.warning(f"Index creation skipped ({keys}): {e}")
+
+    logger.info("✅ MongoDB indexes ensured")
+
+
+# ---------------------------------------------------------------------------
+# ════════════════════════════════════════════════════════════════════════════
+#  COMMON CONVERSATION FETCH HELPER  ← every endpoint must use this
+# ════════════════════════════════════════════════════════════════════════════
+# ---------------------------------------------------------------------------
+
+def fetch_conversations(
+    *,
+    bot_id: Optional[str] = None,
+    thread_id: Optional[str] = None,
+    conversation_id: Optional[str] = None,
+    message_id: Optional[str] = None,
+    role: Optional[str] = None,
+    only_unprocessed: bool = False,
+    skip: int = 0,
+    limit: int = 100,
+    sort_by: str = "createdAt",
+    sort_order: int = DESCENDING,
+    projection: Optional[Dict] = None,
+) -> Dict[str, Any]:
+    """
+    THE single gateway for reading conversations from MongoDB.
+
+    Every API endpoint and service that needs conversation data MUST call
+    this function — never query the collection directly elsewhere.
+
+    Parameters
+    ----------
+    bot_id            : Filter to a specific bot.
+    thread_id         : Filter to a specific thread.
+    conversation_id   : Filter to a specific conversation ID.
+    message_id        : Filter to a specific message ID.
+    role              : Filter by ``from.role`` field  (e.g. ``"user"``).
+    only_unprocessed  : When True only return docs where ``processed != True``.
+    skip              : Pagination offset.
+    limit             : Maximum number of documents to return (0 = no limit).
+    sort_by           : Field to sort by (default ``createdAt``).
+    sort_order        : ``DESCENDING`` (default) or ``ASCENDING``.
+    projection        : MongoDB projection dict. ``_id`` is always stringified.
+
+    Returns
+    -------
+    {
+        "conversations": [...],   # list of document dicts (_id → str)
+        "total":         int,     # total matching docs (before skip/limit)
+        "skip":          int,
+        "limit":         int,
+        "timestamp":     str,
+    }
+    """
+    db = get_mongodb()
+    if db is None:
+        logger.error("fetch_conversations: MongoDB not connected")
+        return {"conversations": [], "total": 0, "skip": skip, "limit": limit, "timestamp": now()}
+
+    collection = db[MONGODB_CONVERSATIONS_COLLECTION]
+
+    # ── Build filter ────────────────────────────────────────────────────────
+    flt: Dict[str, Any] = {}
+
+    if bot_id:
+        flt["botId"] = bot_id
+    if thread_id:
+        flt["threadId"] = thread_id
+    if conversation_id:
+        flt["conversationId"] = conversation_id
+    if message_id:
+        flt["messageId"] = message_id
+    if role:
+        flt["from.role"] = role
+    if only_unprocessed:
+        flt["processed"] = {"$ne": True}
+
+    # ── Count (before pagination) ────────────────────────────────────────────
+    total = collection.count_documents(flt)
+
+    # ── Query ───────────────────────────────────────────────────────────────
+    cursor = collection.find(flt, projection or {})
+    cursor = cursor.sort(sort_by, sort_order)
+    if skip:
+        cursor = cursor.skip(skip)
+    if limit:
+        cursor = cursor.limit(limit)
+
+    # ── Serialise ───────────────────────────────────────────────────────────
+    conversations = []
+    for doc in cursor:
+        if "_id" in doc:
+            doc["_id"] = str(doc["_id"])
+        conversations.append(doc)
+
+    return {
+        "conversations": conversations,
+        "total": total,
+        "skip": skip,
+        "limit": limit,
+        "timestamp": now(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Write helpers
+# ---------------------------------------------------------------------------
+
+def save_conversation(conversation_data: dict) -> bool:
+    """
+    Insert a validated conversation document into MongoDB.
+
+    The document must contain at minimum:
+        conversationId, botId, threadId, userId, model, activity, validation
+
+    Returns True on success.
+    """
+    db = get_mongodb()
+    if db is None:
+        logger.error("save_conversation: MongoDB not connected")
+        return False
+
+    collection = db[MONGODB_CONVERSATIONS_COLLECTION]
+
+    # Validate required top-level fields
+    required = ["conversationId", "botId", "userId", "threadId", "model", "activity", "validation"]
+    missing = [f for f in required if not conversation_data.get(f)]
+    if missing:
+        logger.warning(f"save_conversation: missing fields {missing}")
+        return False
+
+    # Validate activity sub-fields
+    activity = conversation_data.get("activity", {})
+    if not isinstance(activity, dict) or not all(k in activity for k in ("role", "text", "timestamp")):
+        logger.warning("save_conversation: malformed activity field")
+        return False
+
+    # Validate validation sub-fields
+    validation = conversation_data.get("validation", {})
+    if not isinstance(validation, dict):
+        logger.warning("save_conversation: validation must be a dict")
+        return False
+
+    required_val = ["prompt", "is_safe", "blocked", "risk_level", "detections", "metrics", "timestamp"]
+    missing_val = [f for f in required_val if f not in validation]
+    if missing_val:
+        logger.warning(f"save_conversation: validation missing fields {missing_val}")
+        return False
+
+    # Normalise
+    doc = {
+        "conversationId": str(conversation_data["conversationId"]),
+        "botId":          str(conversation_data["botId"]),
+        "userId":         str(conversation_data["userId"]),
+        "threadId":       str(conversation_data["threadId"]),
+        "model":          str(conversation_data["model"]),
+        "activity": {
+            "role":      activity.get("role", "user"),
+            "text":      str(activity.get("text", "")),
+            "timestamp": activity.get("timestamp", now()),
+        },
+        "validation": {
+            "prompt":        str(validation.get("prompt", "")),
+            "prompt_length": len(validation.get("prompt", "")),
+            "is_safe":       bool(validation.get("is_safe", False)),
+            "blocked":       bool(validation.get("blocked", False)),
+            "risk_level":    str(validation.get("risk_level", "UNKNOWN")),
+            "detections":    validation.get("detections", {}),
+            "metrics":       validation.get("metrics", {}),
+            "timestamp":     validation.get("timestamp", now()),
+        },
+        "processed": conversation_data.get("processed", False),
+        "createdAt": conversation_data.get("createdAt", now()),
+        "updatedAt": now(),
+    }
+
+    # Optional fields
+    if conversation_data.get("messageId"):
+        doc["messageId"] = str(conversation_data["messageId"])
+    if conversation_data.get("source"):
+        doc["source"] = str(conversation_data["source"])
+    if validation.get("block_reason"):
+        doc["validation"]["block_reason"] = str(validation["block_reason"])
+    if validation.get("llm_response"):
+        doc["validation"]["llm_response"] = str(validation["llm_response"])
+    if conversation_data.get("security_log_id"):
+        doc["security_log_id"] = str(conversation_data["security_log_id"])
+
+    doc.pop("_id", None)
+
+    try:
+        collection.insert_one(doc)
+        logger.debug(f"Saved conversation {doc['conversationId']}")
         return True
-    
-    except Exception as e:
-        logger.error(f"Error saving security log for bot {bot_id}: {str(e)}")
+    except Exception as exc:
+        logger.error(f"save_conversation error: {exc}")
         return False
 
 
-def delete_bot_security_log(bot_id: str) -> Dict[str, Any]:
-    """Delete security log for a bot session from MongoDB"""
+def insert_test_message(
+    bot_id: str,
+    thread_id: str,
+    conversation_id: str,
+    message_id: str,
+    text: str,
+    user_id: str = "test_user",
+) -> bool:
+    """
+    Insert a raw message document into the conversations collection in the
+    exact shape the realtime monitor expects.
+
+    The monitor's Change Stream will pick this up, scan it, and write
+    the result to security_logs/{bot_id}.json automatically.
+
+    This is the ONLY write path for the /api/test-chat endpoint.
+    No validation happens here — validation is the monitor's job.
+    """
+    db = get_mongodb()
+    if db is None:
+        logger.error("insert_test_message: MongoDB not connected")
+        return False
+
+    collection = db[MONGODB_CONVERSATIONS_COLLECTION]
+
+    doc = {
+        "messageId":      message_id,
+        "botId":          bot_id,
+        "threadId":       thread_id,
+        "conversationId": conversation_id,
+        "userId":         user_id,
+        "from": {
+            "role": "user",
+            "id":   user_id,
+        },
+        "activity": {
+            "role":      "user",
+            "text":      text,
+            "timestamp": now(),
+        },
+        "processed": False,
+        "source":    "test_chat",
+        "createdAt": now(),
+        "updatedAt": now(),
+    }
+
     try:
-        db = get_mongodb()
-        if db is None:
-            return {"success": False, "message": "MongoDB not connected"}
-        
-        security_logs = db[MONGODB_SECURITY_LOGS_COLLECTION]
-        result = security_logs.delete_one({"bot_id": bot_id})
-        
-        if result.deleted_count > 0:
-            logger.info(f"Deleted security log for bot {bot_id}")
-            return {"success": True, "message": f"Security log deleted for bot_id: {bot_id}"}
-        else:
-            return {"success": False, "message": f"No security log found for bot_id: {bot_id}"}
-    
-    except Exception as e:
-        logger.error(f"Error deleting security log for bot {bot_id}: {str(e)}")
-        return {"success": False, "message": f"Error deleting log: {str(e)}"}
+        collection.insert_one(doc)
+        logger.info(f"insert_test_message: inserted {message_id} for bot {bot_id}")
+        return True
+    except Exception as exc:
+        logger.error(f"insert_test_message error: {exc}")
+        return False
 
 
-def list_all_bot_sessions(limit: int = None, skip: int = 0) -> Dict[str, Any]:
-    """List all bot sessions with security logs from MongoDB"""
-    try:
-        db = get_mongodb()
-        if db is None:
-            return {"sessions": [], "total": 0}
-        
-        security_logs = db[MONGODB_SECURITY_LOGS_COLLECTION]
-        
-        query = security_logs.find({})
-        total = security_logs.count_documents({})
-        
-        if skip:
-            query = query.skip(skip)
-        if limit:
-            query = query.limit(limit)
-        
-        bot_sessions = []
-        for log in query:
-            if "_id" in log:
-                del log["_id"]
-            bot_sessions.append(log)
-        
-        return {"sessions": bot_sessions, "total": total}
-    
-    except Exception as e:
-        logger.error(f"Error listing bot sessions: {str(e)}")
-        return {"sessions": [], "total": 0}
-
-
-# ============================================================================
-# BATCH PROCESSING FUNCTIONS FOR CONVERSATION SECURITY SCANNING
-# ============================================================================
+# ---------------------------------------------------------------------------
+# Batch processing helpers (used by /api/batch/* endpoints)
+# ---------------------------------------------------------------------------
 
 def get_unprocessed_conversations(limit: int = 1) -> List[Dict[str, Any]]:
-    """Get unprocessed conversations from MongoDB"""
-    try:
-        db = get_mongodb()
-        if db is None:
-            logger.error("MongoDB not connected")
-            return []
-        
-        conversations = db[MONGODB_CONVERSATIONS_COLLECTION]
-        
-        # Get conversations that haven't been processed (processed = False or missing)
-        query = conversations.find({"processed": {"$ne": True}}).limit(limit)
-        
-        results = []
-        for conv in query:
-            if "_id" in conv:
-                # Keep _id but don't remove it, we need it for tracking
-                pass
-            results.append(conv)
-        
-        return results
-    
-    except Exception as e:
-        logger.error(f"Error fetching unprocessed conversations: {str(e)}")
-        return []
+    """
+    Return up to *limit* documents where ``processed != True``.
+    Uses fetch_conversations() internally.
+    """
+    result = fetch_conversations(only_unprocessed=True, limit=limit, sort_order=ASCENDING)
+    return result["conversations"]
 
 
-def mark_conversation_processed(conversation_id: str, security_log_id: str = None) -> bool:
-    """Mark a conversation as processed and link to security log"""
+def mark_conversation_processed(message_or_conv_id: str, security_log_id: str = None) -> bool:
+    """
+    Mark a message document as processed=True in MongoDB.
+
+    Accepts any of:
+    - A 24-char hex ObjectId string  → matches _id
+    - A messageId string             → matches messageId  (backfill uses this)
+    - A conversationId string        → matches conversationId  (legacy callers)
+
+    messageId is tried first so the backfill works correctly.
+    """
+    db = get_mongodb()
+    if db is None:
+        return False
+
+    collection = db[MONGODB_CONVERSATIONS_COLLECTION]
+    update_fields = {"processed": True, "processed_at": now()}
+    if security_log_id:
+        update_fields["security_log_id"] = security_log_id
+
+    id_str = str(message_or_conv_id)
+
+    # Determine filter — try _id (24-char hex), then messageId, then conversationId
+    if len(id_str) == 24:
+        try:
+            flt: Dict[str, Any] = {"_id": ObjectId(id_str)}
+        except Exception:
+            flt = {"messageId": id_str}
+    elif id_str.startswith("msg_"):
+        flt = {"messageId": id_str}
+    else:
+        flt = {"conversationId": id_str}
+
     try:
-        db = get_mongodb()
-        if db is None:
-            return False
-        
-        conversations = db[MONGODB_CONVERSATIONS_COLLECTION]
-        
-        update_data = {
-            "processed": True,
-            "processed_at": now(),
-        }
-        
-        if security_log_id:
-            update_data["security_log_id"] = security_log_id
-        
-        # Use _id field if provided, or conversationId
-        result = conversations.update_one(
-            {"_id": conversation_id} if len(str(conversation_id)) == 24 else {"conversationId": conversation_id},
-            {"$set": update_data}
-        )
-        
-        return result.modified_count > 0
-    
-    except Exception as e:
-        logger.error(f"Error marking conversation {conversation_id} as processed: {str(e)}")
+        result = collection.update_one(flt, {"$set": update_fields})
+        if result.modified_count > 0:
+            logger.debug(f"mark_conversation_processed: marked {id_str!r}")
+            return True
+        logger.warning(f"mark_conversation_processed: no document matched for {id_str!r}")
+        return False
+    except Exception as exc:
+        logger.error(f"mark_conversation_processed error: {exc}")
         return False
 
 
 def get_processing_stats() -> Dict[str, Any]:
-    """Get batch processing statistics"""
+    """Return counts of total / processed / pending conversations."""
+    db = get_mongodb()
+    if db is None:
+        return {"error": "MongoDB not connected"}
+
+    collection = db[MONGODB_CONVERSATIONS_COLLECTION]
     try:
-        db = get_mongodb()
-        if db is None:
-            return {"error": "MongoDB not connected"}
-        
-        conversations = db[MONGODB_CONVERSATIONS_COLLECTION]
-        security_logs = db[MONGODB_SECURITY_LOGS_COLLECTION]
-        
-        total_conversations = conversations.count_documents({})
-        processed_conversations = conversations.count_documents({"processed": True})
-        pending_conversations = total_conversations - processed_conversations
-        
-        total_security_logs = security_logs.count_documents({})
-        total_security_events = 0
-        
-        # Count total security events across all logs
-        for log in security_logs.find({}):
-            events = log.get("security_events", [])
-            total_security_events += len(events)
-        
+        total     = collection.count_documents({})
+        processed = collection.count_documents({"processed": True})
+        pending   = total - processed
         return {
-            "total_conversations": total_conversations,
-            "processed_conversations": processed_conversations,
-            "pending_conversations": pending_conversations,
-            "processing_percentage": round((processed_conversations / total_conversations * 100), 2) if total_conversations > 0 else 0,
-            "total_security_logs": total_security_logs,
-            "total_security_events": total_security_events
+            "total_conversations":     total,
+            "processed_conversations": processed,
+            "pending_conversations":   pending,
+            "processing_percentage":   round(processed / total * 100, 2) if total else 0,
         }
-    
-    except Exception as e:
-        logger.error(f"Error getting processing stats: {str(e)}")
-        return {"error": str(e)}
+    except Exception as exc:
+        logger.error(f"get_processing_stats error: {exc}")
+        return {"error": str(exc)}
 
 
-def save_conversation(conversation_data: dict) -> bool:
-    """
-    Save a conversation to MongoDB conversations collection.
-    
-    Ensures data conforms to the standardized conversation schema defined in CONVERSATION_SCHEMA.md
-    
-    Args:
-        conversation_data: Dictionary with required fields:
-            - conversationId: unique ID
-            - botId: bot session ID
-            - userId: user ID
-            - threadId: thread ID
-            - model: LLM model name
-            - activity: {"role", "text", "timestamp"}
-            - validation: {"prompt", "is_safe", "blocked", "detections", "metrics", ...}
-    
-    Returns:
-        bool: True if saved successfully
-    """
-    try:
-        db = get_mongodb()
-        if db is None:
-            logger.error("MongoDB not connected - cannot save conversation")
-            return False
-        
-        conversations = db[MONGODB_CONVERSATIONS_COLLECTION]
-        
-        # Validate required fields exist
-        required_fields = ["conversationId", "botId", "userId", "threadId", "model", "activity", "validation"]
-        missing_fields = [f for f in required_fields if f not in conversation_data or conversation_data[f] is None]
-        
-        if missing_fields:
-            logger.warning(f"Conversation missing required fields: {missing_fields}")
-            return False
-        
-        # Validate activity structure
-        if not isinstance(conversation_data.get("activity"), dict):
-            logger.warning("Activity must be a dictionary")
-            return False
-        
-        activity_required = ["role", "text", "timestamp"]
-        activity_missing = [f for f in activity_required if f not in conversation_data["activity"]]
-        if activity_missing:
-            logger.warning(f"Activity missing fields: {activity_missing}")
-            return False
-        
-        # Validate validation structure
-        if not isinstance(conversation_data.get("validation"), dict):
-            logger.warning("Validation must be a dictionary")
-            return False
-        
-        validation_required = ["prompt", "is_safe", "blocked", "risk_level", "detections", "metrics", "timestamp"]
-        validation_missing = [f for f in validation_required if f not in conversation_data["validation"]]
-        if validation_missing:
-            logger.warning(f"Validation missing fields: {validation_missing}")
-            return False
-        
-        # Normalize the conversation data
-        normalized_data = {
-            "conversationId": str(conversation_data["conversationId"]),
-            "botId": str(conversation_data["botId"]),
-            "userId": str(conversation_data["userId"]),
-            "threadId": str(conversation_data["threadId"]),
-            "model": str(conversation_data["model"]),
-            "activity": {
-                "role": conversation_data["activity"].get("role", "user"),
-                "text": str(conversation_data["activity"].get("text", "")),
-                "timestamp": conversation_data["activity"].get("timestamp", now())
-            },
-            "validation": {
-                "prompt": str(conversation_data["validation"].get("prompt", "")),
-                "prompt_length": len(conversation_data["validation"].get("prompt", "")),
-                "is_safe": bool(conversation_data["validation"].get("is_safe", False)),
-                "blocked": bool(conversation_data["validation"].get("blocked", False)),
-                "risk_level": str(conversation_data["validation"].get("risk_level", "UNKNOWN")),
-                "detections": conversation_data["validation"].get("detections", {}),
-                "metrics": conversation_data["validation"].get("metrics", {}),
-                "timestamp": conversation_data["validation"].get("timestamp", now())
-            },
-            "processed": conversation_data.get("processed", False),
-            "createdAt": conversation_data.get("createdAt", now()),
-            "updatedAt": now()
-        }
-        
-        # Add optional fields if present
-        if conversation_data.get("block_reason"):
-            normalized_data["validation"]["block_reason"] = str(conversation_data["block_reason"])
-        
-        if conversation_data["validation"].get("blocked") and not conversation_data["validation"].get("is_safe"):
-            # Blocked messages should have block_reason
-            if "block_reason" not in normalized_data["validation"]:
-                normalized_data["validation"]["block_reason"] = conversation_data["validation"].get("message", "Security threat detected")
-        
-        if conversation_data["validation"].get("llm_response"):
-            normalized_data["validation"]["llm_response"] = str(conversation_data["validation"]["llm_response"])
-        
-        if conversation_data.get("security_log_id"):
-            normalized_data["security_log_id"] = str(conversation_data["security_log_id"])
-        
-        # Remove _id if present to allow insert
-        if "_id" in normalized_data:
-            del normalized_data["_id"]
-        
-        # Insert conversation
-        result = conversations.insert_one(normalized_data)
-        
-        logger.debug(f"Saved conversation {normalized_data['conversationId']} (thread: {normalized_data['threadId']})")
-        return True
-    
-    except Exception as e:
-        logger.error(f"Error saving conversation: {str(e)}")
-        return False
-
+# ---------------------------------------------------------------------------
+# Legacy shims — kept so nothing else in the codebase breaks while migrating
+# ---------------------------------------------------------------------------
 
 def build_conversation(
     bot_id: str,
@@ -406,96 +513,47 @@ def build_conversation(
     llm_response: Optional[str] = None,
     block_reason: Optional[str] = None,
     scan_results: Optional[Any] = None,
-    request_timestamp: Optional[str] = None
+    request_timestamp: Optional[str] = None,
 ) -> dict:
     """
-    Build a standardized conversation object following CONVERSATION_SCHEMA.md
-    
-    This ensures all conversations conform to the defined schema before being saved.
-    
-    Args:
-        bot_id: Bot session ID
-        prompt: Original user prompt
-        model: LLM model name
-        is_safe: Whether prompt passed security checks
-        blocked: Whether request was blocked
-        risk_level: Risk level (SAFE, MEDIUM, HIGH, CRITICAL)
-        detections: Security scanner detections dictionary
-        metrics: Performance metrics dictionary
-        llm_response: LLM response text (only when safe)
-        block_reason: Reason for blocking (only when blocked)
-        scan_results: Optional scan results object with .message attribute
-        request_timestamp: Optional custom timestamp
-    
-    Returns:
-        dict: Standardized conversation object ready for save_conversation()
+    Build a standardised conversation dict ready for save_conversation().
+
+    Kept for backward compatibility — new code should build the dict inline.
     """
-    import time as time_module
-    
-    timestamp = request_timestamp or now()
-    
-    # Extract user/thread IDs from botId
-    bot_parts = bot_id.split('_')
-    user_id = f"user_{bot_parts[1]}" if len(bot_parts) > 1 else f"user_{bot_id}"
-    thread_id = f"thread_{bot_parts[1]}" if len(bot_parts) > 1 else f"thread_{bot_id}"
-    
+    timestamp  = request_timestamp or now()
+    bot_parts  = bot_id.split("_")
+    user_id    = f"user_{bot_parts[1]}"   if len(bot_parts) > 1 else f"user_{bot_id}"
+    thread_id  = f"thread_{bot_parts[1]}" if len(bot_parts) > 1 else f"thread_{bot_id}"
+
     conversation = {
-        "conversationId": f"conv_{bot_id}_{int(time_module.time() * 1000)}",
-        "botId": bot_id,
-        "userId": user_id,
+        "conversationId": f"conv_{bot_id}_{int(time.time() * 1000)}",
+        "botId":    bot_id,
+        "userId":   user_id,
         "threadId": thread_id,
-        "model": model,
+        "model":    model,
         "activity": {
-            "role": "user",
-            "text": prompt,
-            "timestamp": timestamp
+            "role":      "user",
+            "text":      prompt,
+            "timestamp": timestamp,
         },
         "validation": {
-            "prompt": prompt,
+            "prompt":        prompt,
             "prompt_length": len(prompt),
-            "is_safe": is_safe,
-            "blocked": blocked,
-            "risk_level": risk_level,
-            "detections": detections,
-            "metrics": metrics,
-            "timestamp": timestamp
+            "is_safe":       is_safe,
+            "blocked":       blocked,
+            "risk_level":    risk_level,
+            "detections":    detections,
+            "metrics":       metrics,
+            "timestamp":     timestamp,
         },
-        "processed": False
+        "processed": False,
     }
-    
-    # Add conditional fields based on safety status
+
     if blocked and not is_safe:
-        # When blocked, include block reason
         conversation["validation"]["block_reason"] = block_reason or (
             scan_results.message if scan_results else "Security threat detected"
         )
-    
     if not blocked and is_safe and llm_response:
-        # When safe, include LLM response
         conversation["validation"]["llm_response"] = llm_response
-    
+
     return conversation
-
-
-def _get_default_security_log(bot_id: str) -> dict:
-    """Get default empty security log structure"""
-    return {
-        "bot_id": bot_id,
-        "created_at": now(),
-        "security_events": [],
-        "total_prompts": 0,
-        "blocked_prompts": 0,
-        "pii_detections": 0,
-        "jailbreak_attempts": 0,
-        "toxicity_detections": 0,
-        "secrets_detections": 0,
-        "last_updated": now()
-    }
-
-
-def close_mongodb():
-    """Close MongoDB connection"""
-    global _client
-    if _client:
-        _client.close()
-        logger.info("MongoDB connection closed")

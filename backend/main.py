@@ -1,34 +1,79 @@
-from fastapi import FastAPI, HTTPException, status
+"""
+Guardrail Cloud Service — Main API
+====================================
+
+Architecture (read this before touching endpoints)
+----------------------------------------------------
+
+  ┌──────────────────────────────────────────────────────────────────────┐
+  │  /api/test-chat  (POST)                                              │
+  │   → inserts raw message into MongoDB (no scan here)                  │
+  │   → monitor Change-Stream picks it up and scans it asynchronously    │
+  │   → result arrives on the SSE stream (/api/monitor/stream)           │
+  └──────────────────────────────────────────────────────────────────────┘
+
+  ┌──────────────────────────────────────────────────────────────────────┐
+  │  RealtimeMonitor (background task)                                   │
+  │   → watches MongoDB conversations collection via Change Stream       │
+  │   → scans every NEW user message with ConcurrentSecurityScanner      │
+  │   → writes result to  security_logs/{botId}.json  (LOCAL only)      │
+  │   → broadcasts scan events to all SSE subscribers                    │
+  └──────────────────────────────────────────────────────────────────────┘
+
+  ┌──────────────────────────────────────────────────────────────────────┐
+  │  /api/conversations/*  ← ALL conversation reads → MongoDB ONLY       │
+  │  /api/monitor/stream   ← real-time scan events   → SSE              │
+  │  /api/security-logs/*  ← ALL validation details  → LOCAL JSON only  │
+  └──────────────────────────────────────────────────────────────────────┘
+
+Rules enforced here
+--------------------
+1.  Validation / security scanning ONLY happens inside RealtimeMonitor.
+2.  /api/test-chat NEVER calls the scanner directly — it only writes to MongoDB.
+3.  Conversation data is ALWAYS fetched via fetch_conversations() from MongoDB.
+4.  Security-log/validation data is ALWAYS read from local security_logs/*.json.
+5.  The frontend MUST NOT mix these two sources.
+"""
+
+from fastapi import FastAPI, HTTPException, Query, status
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
-from typing import Optional
+from pydantic import BaseModel, Field, validator
+from typing import Optional, List
 import logging
 import time
 import asyncio
 import json
+import uuid
 
-# Local imports
-from config import API_CONFIG, ALLOWED_ORIGINS, AVAILABLE_MODELS, LOG_LEVEL, OPENROUTER_API_KEY
-
-# MongoDB collection names - with backward compatibility
+from config import (
+    API_CONFIG,
+    ALLOWED_ORIGINS,
+    AVAILABLE_MODELS,
+    LOG_LEVEL,
+    OPENROUTER_API_KEY,
+    SECURITY_STORAGE_DIR,
+)
 try:
-    from config import MONGODB_SECURITY_LOGS_COLLECTION, MONGODB_CONVERSATIONS_COLLECTION, MONGODB_THREAD_SUMMARIES_COLLECTION
+    from config import MONGODB_CONVERSATIONS_COLLECTION
 except ImportError:
-    # Fallback for older config.py files
-    MONGODB_SECURITY_LOGS_COLLECTION = "security_logs"
-    MONGODB_CONVERSATIONS_COLLECTION = "conversations"
-    MONGODB_THREAD_SUMMARIES_COLLECTION = "thread_summaries"
-    print("⚠️  Warning: Using default MongoDB collection names. Consider updating config.py")
+    MONGODB_CONVERSATIONS_COLLECTION = "messages"
+
 from models import (
-    ChatRequest, ScanRequest, ChatResponse, SecurityScanResult,
-    HealthResponse, StatsResponse
+    ScanRequest, SecurityScanResult,
+    HealthResponse, StatsResponse,
 )
 from mongodb_storage import (
-    load_bot_security_log, save_bot_security_log,
-    delete_bot_security_log, list_all_bot_sessions,
-    connect_mongodb, close_mongodb,
-    get_unprocessed_conversations, mark_conversation_processed,
-    get_processing_stats, get_mongodb, save_conversation, build_conversation
+    connect_mongodb,
+    close_mongodb,
+    get_mongodb,
+    fetch_conversations,        # ← THE common helper
+    save_conversation,
+    insert_test_message,
+    get_unprocessed_conversations,
+    mark_conversation_processed,
+    get_processing_stats,
+    build_conversation,
 )
 from security_scanner import ConcurrentSecurityScanner, shutdown_scanner
 from llm_client import call_openrouter
@@ -36,22 +81,17 @@ from datetime_utils import now
 from realtime_monitor import get_monitor, shutdown_monitor
 from pathlib import Path
 
-# Import SECURITY_STORAGE_DIR with fallback
-try:
-    from config import SECURITY_STORAGE_DIR
-except ImportError:
-    SECURITY_STORAGE_DIR = Path("security_logs")
-    SECURITY_STORAGE_DIR.mkdir(exist_ok=True)
-    print("⚠️  Warning: Using default security_logs directory")
-
-# Configure logging
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
 logging.basicConfig(level=LOG_LEVEL)
 logger = logging.getLogger(__name__)
 
-# Initialize FastAPI app
+# ---------------------------------------------------------------------------
+# App
+# ---------------------------------------------------------------------------
 app = FastAPI(**API_CONFIG)
 
-# CORS Configuration
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
@@ -60,1314 +100,350 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Initialize security scanner
+# Scan-only detector (for /api/scan endpoint; NOT used by test-chat)
 detector = ConcurrentSecurityScanner()
 
 
-async def sse_event_generator(monitor):
-    """Generate SSE-formatted events from monitor"""
-    try:
-        async for event in monitor.watch_and_process():
-            event_type = event.get("event", "message")
-            event_data = event.get("data", {})
-            
-            # Format as SSE
-            sse_message = f"event: {event_type}\n"
-            sse_message += f"data: {json.dumps(event_data)}\n\n"
-            
-            yield sse_message
-            
-    except asyncio.CancelledError:
-        logger.info("SSE stream cancelled")
-        monitor.stop()
-    except Exception as e:
-        logger.error(f"SSE stream error: {str(e)}")
-        error_event = f"event: error\ndata: {json.dumps({'message': str(e)})}\n\n"
-        yield error_event
+# ============================================================================
+# REQUEST / RESPONSE MODELS
+# ============================================================================
 
+class ChatRequest(BaseModel):
+    """
+    Request body for /api/chat  (the main user-facing chat endpoint).
+    """
+    prompt:  str = Field(..., min_length=1, max_length=10_000)
+    bot_id:  str = Field(..., description="Bot / session ID")
+    model:   str = Field(default="openai/gpt-4o-mini")
+
+    @validator("prompt")
+    def strip_prompt(cls, v):
+        v = v.strip()
+        if not v:
+            raise ValueError("prompt cannot be blank")
+        return v
+
+
+class TestChatRequest(BaseModel):
+    """
+    Request body for /api/test-chat.
+    The prompt is stored in MongoDB AS-IS; the monitor handles scanning.
+    """
+    prompt:  str = Field(..., min_length=1, max_length=10_000)
+    bot_id:  str = Field(..., description="Bot / session ID")
+    model:   str = Field(default="openai/gpt-4o-mini")
+
+    @validator("prompt")
+    def strip_prompt(cls, v):
+        v = v.strip()
+        if not v:
+            raise ValueError("prompt cannot be blank")
+        return v
+
+
+# ============================================================================
+# HEALTH
+# ============================================================================
 
 @app.get("/health", response_model=HealthResponse, tags=["System"])
 async def health_check():
-    """Health check endpoint"""
     return HealthResponse(
         status="connected",
-        service="Jailbreak-Protected LLM API (Concurrent Mode)",
+        service="Guardrail Cloud Service",
         timestamp=now(),
-        scanners_active=len(detector.scanners) + 1
+        scanners_active=len(detector.scanners) + 1,
     )
 
 
-@app.post(
-    "/api/chat",
-    response_model=ChatResponse,
-    tags=["Chat"]
-)
+# ============================================================================
+#  MAIN CHAT ENDPOINT  /api/chat
+#
+#  Flow (zero blocking for the user):
+#    1. Call LLM immediately → return response to frontend
+#    2. asyncio.create_task() fires background coroutine that stores:
+#         • user message doc  → MongoDB  (monitor scans it via Change Stream)
+#         • bot response doc  → MongoDB  (stored separately, role = "bot")
+#
+#  The user never waits for storage or scanning.
+# ============================================================================
+
+async def _store_conversation_background(
+    bot_id: str,
+    thread_id: str,
+    conversation_id: str,
+    user_message_id: str,
+    bot_message_id: str,
+    user_id: str,
+    prompt: str,
+    llm_response: str,
+    model: str,
+    ts: str,
+) -> None:
+    """
+    Fire-and-forget coroutine that persists one user turn to MongoDB.
+
+    Stores TWO documents:
+      1. User message  — picked up by the monitor's Change Stream for scanning
+      2. Bot response  — stored for conversation history (role = "bot", not scanned)
+    """
+    db = get_mongodb()
+    if db is None:
+        logger.warning("[_store_background] MongoDB not connected — skipping storage")
+        return
+
+    collection = db[MONGODB_CONVERSATIONS_COLLECTION]
+
+    # ── 1. User message document ─────────────────────────────────────────────
+    user_doc = {
+        "messageId":      user_message_id,
+        "botId":          bot_id,
+        "threadId":       thread_id,
+        "conversationId": conversation_id,
+        "userId":         user_id,
+        "from": {
+            "role": "user",
+            "id":   user_id,
+        },
+        "activity": {
+            "role":      "user",
+            "text":      prompt,
+            "timestamp": ts,
+        },
+        "processed": False,
+        "source":    "chat",
+        "createdAt": ts,
+        "updatedAt": ts,
+    }
+
+    # ── 2. Bot response document ──────────────────────────────────────────────
+    bot_doc = {
+        "messageId":      bot_message_id,
+        "botId":          bot_id,
+        "threadId":       thread_id,
+        "conversationId": conversation_id,
+        "userId":         user_id,
+        "from": {
+            "role": "bot",
+            "id":   bot_id,
+        },
+        "activity": {
+            "role":      "bot",
+            "text":      llm_response,
+            "timestamp": now(),
+        },
+        "model":     model,
+        "processed": True,          # bot messages are never scanned
+        "source":    "chat",
+        "createdAt": now(),
+        "updatedAt": now(),
+    }
+
+    try:
+        collection.insert_many([user_doc, bot_doc], ordered=False)
+        logger.debug(f"[_store_background] Stored user={user_message_id} bot={bot_message_id}")
+    except Exception as exc:
+        # Surface per-document errors from BulkWriteError so you can see which doc failed
+        from pymongo.errors import BulkWriteError
+        if isinstance(exc, BulkWriteError):
+            for we in exc.details.get("writeErrors", []):
+                failed_id = we.get("op", {}).get("messageId", "?")
+                code = we.get("code", "?")
+                msg  = we.get("errmsg", "?")
+                logger.error(
+                    f"[_store_background] Insert rejected for messageId={failed_id} "
+                    f"(code={code}): {msg}"
+                )
+        else:
+            logger.error(f"[_store_background] Storage failed: {exc}")
+
+
+@app.post("/api/chat", tags=["Chat"])
 async def chat(request: ChatRequest):
     """
-    ⚡ CONCURRENT CHAT ENDPOINT ⚡
-    Handles MULTIPLE BOTS simultaneously with thread-safe operations
+    💬 MAIN CHAT ENDPOINT — smooth, non-blocking.
+
+    Returns the LLM response immediately.
+    Storage + security scanning happen in the background via the monitor.
     """
     try:
-        request_start = time.time()
-        
-        # Load bot's security log (thread-safe)
-        bot_security_log = load_bot_security_log(request.bot_id)
-        bot_security_log["total_prompts"] += 1
-        
-        logger.info(f"[Bot: {request.bot_id[:16]}...] Processing prompt")
-        
-        # Run security scan in thread pool (concurrent-safe)
-        loop = asyncio.get_event_loop()
-        scan_results = await loop.run_in_executor(
-            None,
-            detector.scan_prompt_parallel, 
-            request.prompt,
-            request.bot_id
+        ts_ms           = int(time.time() * 1000)
+        user_message_id = f"msg_user_{request.bot_id}_{ts_ms}_{uuid.uuid4().hex[:6]}"
+        bot_message_id  = f"msg_bot_{request.bot_id}_{ts_ms}_{uuid.uuid4().hex[:6]}"
+        conversation_id = f"conv_{request.bot_id}_{ts_ms}"
+        thread_id = (
+            f"thread_{request.bot_id.split('_')[1]}"
+            if "_" in request.bot_id
+            else f"thread_{request.bot_id}"
         )
-        
-        # Extract results
-        pii_detection = scan_results.detections.get("pii", {})
-        pii_entities = pii_detection.get("entities", [])
-        anonymized_prompt = scan_results.detections.get("pii", {}).get("anonymized_prompt", request.prompt)
-        
-        # Prepare security event
-        security_event = {
-            "timestamp": now(),
-            "prompt": request.prompt,
-            "prompt_length": len(request.prompt),
-            "detections": scan_results.detections,
-            "risk_level": scan_results.risk_level,
-            "is_safe": scan_results.is_safe,
-            "scan_duration": scan_results.scan_duration,
-            "blocked": False,
-            "anonymized_prompt": anonymized_prompt if pii_entities else None,
-            "llm_response": None,
-            "metrics": {
-                "request_start_time": request_start,
-                "scan_time": round(scan_results.scan_duration, 4),
-                "scanner_details": scan_results.detections.get("metrics", {}).get("scanner_times", {}),
-                "llm_time": 0.0,
-                "total_time": 0.0
-            }
-        }
+        user_id = (
+            f"user_{request.bot_id.split('_')[1]}"
+            if "_" in request.bot_id
+            else f"user_{request.bot_id}"
+        )
+        ts = now()
 
-        # Handle PII Detection
-        if pii_entities:
-            logger.info(f"[Bot: {request.bot_id[:16]}...] PII detected: {len(pii_entities)} entities")
-            bot_security_log["pii_detections"] += 1
-            prompt_to_send = anonymized_prompt
-        else:
-            prompt_to_send = request.prompt
+        # ── Call LLM immediately ───────────────────────────────────────────────
+        llm_response_raw = await call_openrouter(request.prompt, request.model)
+        assistant_message = (
+            llm_response_raw
+            .get("choices", [{}])[0]
+            .get("message", {})
+            .get("content", "")
+        )
 
-        # Check for threats (BLOCK if detected)
-        if not scan_results.is_safe:
-            logger.warning(f"[Bot: {request.bot_id[:16]}...] Threat detected - {scan_results.risk_level}")
-            
-            bot_security_log["blocked_prompts"] += 1
-            
-            # 🔧 TRACK NEW SCANNER DETECTIONS:
-            # Add counters to bot_security_log for new scanners
-            # ====================================================================
-            if scan_results.detections.get("prompt_injection", {}).get("detected"):
-                bot_security_log["jailbreak_attempts"] += 1
-            if scan_results.detections.get("toxicity", {}).get("detected"):
-                bot_security_log["toxicity_detections"] += 1
-            
-            # Track secrets from PII scanner results
-            pii_results = scan_results.detections.get("pii", {})
-            if pii_results.get("secrets_detected", False):
-                bot_security_log["secrets_detections"] += 1
-            
-            # Example for new scanners:
-            # if scan_results.detections.get("ban_topics", {}).get("detected"):
-            #     bot_security_log["banned_topics_detections"] += 1
-            # ====================================================================
-            
-            security_event["blocked"] = True
-            security_event["block_reason"] = scan_results.message
-            security_event["metrics"]["total_time"] = round(time.time() - request_start, 4)
-            
-            bot_security_log["security_events"].append(security_event)
-            bot_security_log["last_updated"] = now()
-            save_bot_security_log(request.bot_id, bot_security_log)
-            
-            # Save conversation to MongoDB
-            conversation_data = {
-                "conversationId": f"conv_{request.bot_id}_{int(time.time() * 1000)}",
-                "botId": request.bot_id,
-                "threadId": f"thread_{request.bot_id.split('_')[1]}" if "_" in request.bot_id else request.bot_id,
-                "userId": f"user_{request.bot_id.split('_')[1]}" if "_" in request.bot_id else request.bot_id,
-                "activity": {
-                    "role": "user",
-                    "text": request.prompt,
-                    "timestamp": now()
-                },
-                "validation": {
-                    "prompt": request.prompt,
-                    "prompt_length": len(request.prompt),
-                    "is_safe": False,
-                    "blocked": True,
-                    "message": scan_results.message,
-                    "risk_level": scan_results.risk_level,
-                    "detections": scan_results.detections,
-                    "timestamp": now()
-                },
-                "model": request.model
-            }
-            save_conversation(conversation_data)
-            
-            return JSONResponse(
-                status_code=status.HTTP_200_OK,
-                content={
-                    "success": True,
-                    "response": scan_results.message,
-                    "security_scan": {
-                        "is_safe": False,
-                        "risk_level": scan_results.risk_level,
-                        "message": scan_results.message,
-                        "timestamp": scan_results.timestamp
-                    },
-                    "model": request.model,
-                    "timestamp": now()
-                }
+        # ── Fire-and-forget background storage ────────────────────────────────
+        asyncio.create_task(
+            _store_conversation_background(
+                bot_id          = request.bot_id,
+                thread_id       = thread_id,
+                conversation_id = conversation_id,
+                user_message_id = user_message_id,
+                bot_message_id  = bot_message_id,
+                user_id         = user_id,
+                prompt          = request.prompt,
+                llm_response    = assistant_message,
+                model           = request.model,
+                ts              = ts,
             )
-        
-        # Prompt is safe - call LLM
-        logger.info(f"[Bot: {request.bot_id[:16]}...] Safe - calling LLM")
-        
-        # Track LLM call time
-        llm_start = time.time()
-        
-        # Call OpenRouter (async for better concurrency)
-        llm_response = await call_openrouter(prompt_to_send, request.model, has_pii=bool(pii_entities))
-        
-        llm_duration = time.time() - llm_start
-        
-        assistant_message = llm_response.get("choices", [{}])[0].get("message", {}).get("content", "")
-        
-        security_event["llm_response"] = assistant_message
-        security_event["model_used"] = request.model
-        security_event["success"] = True
-        security_event["metrics"]["llm_time"] = round(llm_duration, 4)
-        security_event["metrics"]["total_time"] = round(time.time() - request_start, 4)
-        
-        bot_security_log["security_events"].append(security_event)
-        bot_security_log["last_updated"] = now()
-        save_bot_security_log(request.bot_id, bot_security_log)
-        
-        # Save conversation to MongoDB (successful case)
-        conversation_data = {
-            "conversationId": f"conv_{request.bot_id}_{int(time.time() * 1000)}",
-            "botId": request.bot_id,
-            "threadId": f"thread_{request.bot_id.split('_')[1]}" if "_" in request.bot_id else request.bot_id,
-            "userId": f"user_{request.bot_id.split('_')[1]}" if "_" in request.bot_id else request.bot_id,
-            "activity": {
-                "role": "user",
-                "text": request.prompt,
-                "timestamp": now()
-            },
-            "validation": {
-                "prompt": request.prompt,
-                "prompt_length": len(request.prompt),
-                "llm_response": assistant_message,
-                "is_safe": True,
-                "blocked": False,
-                "risk_level": scan_results.risk_level,
-                "detections": scan_results.detections,
-                "metrics": security_event["metrics"],
-                "timestamp": now()
-            },
-            "model": request.model
-        }
-        save_conversation(conversation_data)
-        
-        total_time = time.time() - request_start
-        logger.info(f"[Bot: {request.bot_id[:16]}...] ✅ Completed in {total_time:.3f}s")
-        
-        return ChatResponse(
-            success=True,
-            response=assistant_message,
-            security_scan=scan_results,
-            model=request.model,
-            usage=llm_response.get("usage", {}),
-            timestamp=now()
         )
-        
+
+        logger.info(
+            f"[chat] bot={request.bot_id!r} responded, "
+            f"storing in background (user={user_message_id})"
+        )
+
+        return {
+            "success":          True,
+            "response":         assistant_message,
+            "message_id":       user_message_id,
+            "conversation_id":  conversation_id,
+            "model":            request.model,
+            "usage":            llm_response_raw.get("usage", {}),
+            "timestamp":        ts,
+        }
+
     except HTTPException:
         raise
-    except Exception as e:
-        logger.error(f"[Bot: {request.bot_id[:16]}...] Error: {str(e)}")
+    except Exception as exc:
+        logger.error(f"[chat] Error: {exc}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Internal server error: {str(e)}"
-        )
-
-
-@app.post(
-    "/api/scan",
-    response_model=SecurityScanResult,
-    tags=["Security"]
-)
-async def scan_only(request: ScanRequest):
-    """Scan prompt with all security checks - concurrent safe"""
-    try:
-        loop = asyncio.get_event_loop()
-        scan_results = await loop.run_in_executor(
-            None,
-            detector.scan_prompt_parallel,
-            request.prompt,
-            "scan-only"
-        )
-        return scan_results
-        
-    except Exception as e:
-        logger.error(f"Scan error: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Scan failed: {str(e)}"
-        )
-
-
-@app.get("/api/security/{bot_id}", tags=["Security Logs"])
-async def get_bot_security_log(bot_id: str):
-    """Retrieve complete security log for a specific bot session"""
-    try:
-        security_data = load_bot_security_log(bot_id)
-        if not security_data.get("security_events"):
-            return {
-                "bot_id": bot_id,
-                "message": "No security events found for this bot session",
-                "security_events": []
-            }
-        return security_data
-    except Exception as e:
-        logger.error(f"Failed to retrieve security log: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to retrieve security log: {str(e)}"
-        )
-
-
-@app.get("/api/security/{bot_id}/summary", tags=["Security Logs"])
-async def get_bot_security_summary(bot_id: str):
-    """Get security summary for a bot session"""
-    try:
-        security_data = load_bot_security_log(bot_id)
-        return {
-            "bot_id": security_data.get("bot_id"),
-            "created_at": security_data.get("created_at"),
-            "last_updated": security_data.get("last_updated"),
-            "statistics": {
-                "total_prompts": security_data.get("total_prompts", 0),
-                "blocked_prompts": security_data.get("blocked_prompts", 0),
-                "pii_detections": security_data.get("pii_detections", 0),
-                "jailbreak_attempts": security_data.get("jailbreak_attempts", 0),
-                "toxicity_detections": security_data.get("toxicity_detections", 0),
-                "secrets_detections": security_data.get("secrets_detections", 0),
-                "total_events": len(security_data.get("security_events", []))
-            }
-        }
-    except Exception as e:
-        logger.error(f"Failed to retrieve security summary: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to retrieve security summary: {str(e)}"
-        )
-
-
-@app.get("/api/security/{bot_id}/pii", tags=["Security Logs"])
-async def get_bot_pii_only(bot_id: str):
-    """Retrieve only PII detections for a specific bot session"""
-    try:
-        security_data = load_bot_security_log(bot_id)
-        pii_events = [
-            event for event in security_data.get("security_events", [])
-            if event.get("detections", {}).get("pii", {}).get("detected", False)
-        ]
-        return {
-            "bot_id": bot_id,
-            "pii_detection_count": len(pii_events),
-            "pii_events": pii_events
-        }
-    except Exception as e:
-        logger.error(f"Failed to retrieve PII data: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to retrieve PII data: {str(e)}"
-        )
-
-
-@app.delete("/api/security/{bot_id}", tags=["Security Logs"])
-async def delete_bot_log(bot_id: str):
-    """Delete all security data for a specific bot session"""
-    try:
-        result = delete_bot_security_log(bot_id)
-        return result
-    except Exception as e:
-        logger.error(f"Failed to delete security log: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to delete security log: {str(e)}"
-        )
-
-
-@app.get("/api/security", tags=["Security Logs"])
-async def list_bot_sessions():
-    """List all bot sessions with security logs from local folder"""
-    try:
-        sessions = []
-        
-        # Scan all thread directories in the local security_logs folder
-        if SECURITY_STORAGE_DIR.exists():
-            for thread_dir in sorted(SECURITY_STORAGE_DIR.iterdir()):
-                if thread_dir.is_dir():
-                    thread_id = thread_dir.name
-                    conversations = []
-                    
-                    # Scan all conversation logs in this thread
-                    for log_file in sorted(thread_dir.glob("*.json")):
-                        try:
-                            with open(log_file, 'r') as f:
-                                log_data = json.load(f)
-                                # Treat each log file as a conversation
-                                conversations.append(log_data)
-                        except Exception as e:
-                            logger.warning(f"Could not read log file {log_file}: {str(e)}")
-                    
-                    # If we have conversations, include this thread
-                    if conversations:
-                        total_prompts = sum(conv.get("total_prompts", 0) for conv in conversations)
-                        blocked_prompts = sum(conv.get("blocked_prompts", 0) for conv in conversations)
-                        pii_detections = sum(conv.get("pii_detections", 0) for conv in conversations)
-                        jailbreak_attempts = sum(conv.get("jailbreak_attempts", 0) for conv in conversations)
-                        toxicity_detections = sum(conv.get("toxicity_detections", 0) for conv in conversations)
-                        secrets_detections = sum(conv.get("secrets_detections", 0) for conv in conversations)
-                        
-                        sessions.append({
-                            "thread_id": thread_id,
-                            "bot_id": conversations[0].get("bot_id", ""),
-                            "created_at": conversations[0].get("created_at", now()),
-                            "last_updated": conversations[-1].get("last_updated", now()),
-                            "conversations": conversations,
-                            "total_prompts": total_prompts,
-                            "blocked_prompts": blocked_prompts,
-                            "pii_detections": pii_detections,
-                            "jailbreak_attempts": jailbreak_attempts,
-                            "toxicity_detections": toxicity_detections,
-                            "secrets_detections": secrets_detections,
-                            "conversation_count": len(conversations)
-                        })
-        
-        logger.info(f"Retrieved {len(sessions)} sessions from local folder")
-        
-        return {
-            "sessions": sessions,
-            "timestamp": now()
-        }
-    except Exception as e:
-        logger.error(f"Failed to list bot sessions: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to list bot sessions: {str(e)}"
+            detail=f"Internal error: {exc}",
         )
 
 
 # ============================================================================
-# BATCH PROCESSING ENDPOINTS FOR CONVERSATION SECURITY SCANNING
+#  TEST CHAT ENDPOINT
+#  Writes the message to MongoDB.  The RealtimeMonitor does the actual scan.
 # ============================================================================
 
-@app.post("/api/batch/process-next", tags=["Batch Processing"])
-async def process_next_conversation():
+@app.post("/api/test-chat", tags=["Test Chat"])
+async def test_chat(request: TestChatRequest):
     """
-    Process the next unprocessed conversation from MongoDB
-    - Fetches one conversation from conversations collection
-    - Scans it for security threats
-    - Stores security log in security_logs collection
-    - Marks conversation as processed
-    Returns immediately after processing one conversation
-    """
-    try:
-        # Get next unprocessed conversation
-        conversations = get_unprocessed_conversations(limit=1)
-        
-        if not conversations:
-            return {
-                "success": False,
-                "message": "No more conversations to process",
-                "processed": False
-            }
-        
-        conversation = conversations[0]
-        conversation_id = conversation.get("_id") or conversation.get("conversationId", "unknown")
-        
-        # Extract message from activity.text field (your MongoDB structure)
-        prompt = conversation.get("activity", {}).get("text", "")
-        
-        # If no activity.text, try other common fields
-        if not prompt:
-            prompt = conversation.get("message", conversation.get("prompt", ""))
-        
-        logger.info(f"Processing conversation: {conversation_id}")
-        
-        # Create bot_id from conversation_id
-        bot_id = f"batch_processing_{conversation_id}"
-        
-        request_start = time.time()
-        
-        # Load or create security log for this batch
-        bot_security_log = load_bot_security_log(bot_id)
-        bot_security_log["total_prompts"] += 1
-        bot_security_log["conversation_id"] = str(conversation_id)
-        
-        # Run security scan
-        loop = asyncio.get_event_loop()
-        scan_results = await loop.run_in_executor(
-            None,
-            detector.scan_prompt_parallel,
-            prompt,
-            bot_id
-        )
-        
-        # Extract PII detection results
-        pii_detection = scan_results.detections.get("pii", {})
-        pii_entities = pii_detection.get("entities", [])
-        anonymized_prompt = pii_detection.get("anonymized_prompt", prompt)
-        
-        # Create security event
-        security_event = {
-            "timestamp": now(),
-            "prompt": prompt,
-            "prompt_length": len(prompt),
-            "detections": scan_results.detections,
-            "risk_level": scan_results.risk_level,
-            "is_safe": scan_results.is_safe,
-            "scan_duration": scan_results.scan_duration,
-            "blocked": False,
-            "anonymized_prompt": anonymized_prompt if pii_entities else None,
-            "metrics": {
-                "request_start_time": request_start,
-                "scan_time": round(scan_results.scan_duration, 4),
-                "total_time": round(time.time() - request_start, 4)
-            }
-        }
-        
-        # Update counters if threats detected
-        if not scan_results.is_safe:
-            bot_security_log["blocked_prompts"] += 1
-            security_event["blocked"] = True
-            security_event["block_reason"] = scan_results.message
-            
-            if scan_results.detections.get("prompt_injection", {}).get("detected"):
-                bot_security_log["jailbreak_attempts"] += 1
-            if scan_results.detections.get("toxicity", {}).get("detected"):
-                bot_security_log["toxicity_detections"] += 1
-        
-        # Update PII counter
-        if pii_entities:
-            bot_security_log["pii_detections"] += 1
-        
-        # Add event to log and save to MongoDB
-        bot_security_log["security_events"].append(security_event)
-        bot_security_log["last_updated"] = now()
-        save_bot_security_log(bot_id, bot_security_log)
-        
-        # Mark conversation as processed with reference to security log
-        mark_conversation_processed(conversation_id, bot_id)
-        
-        # Get current processing stats
-        stats = get_processing_stats()
-        
-        logger.info(f"✅ Processed conversation {conversation_id} - Safe: {scan_results.is_safe}")
-        
-        return {
-            "success": True,
-            "processed": True,
-            "conversation_id": str(conversation_id),
-            "security_log_id": bot_id,
-            "scan_results": {
-                "is_safe": scan_results.is_safe,
-                "risk_level": scan_results.risk_level,
-                "pii_detected": bool(pii_entities),
-                "threat_detected": not scan_results.is_safe,
-                "scan_duration": round(scan_results.scan_duration, 4),
-                "message": scan_results.message
-            },
-            "processing_stats": stats,
-            "timestamp": now()
-        }
-        
-    except Exception as e:
-        logger.error(f"Error processing conversation: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error processing conversation: {str(e)}"
-        )
+    ✉️  TEST CHAT — stores message in MongoDB, validation happens via monitor.
 
+    Flow
+    ----
+    1.  Generate unique IDs for this message.
+    2.  Insert the raw document into the MongoDB conversations collection.
+    3.  Return immediately — the monitor's Change Stream will pick up the new
+        document, scan it, and push the result over SSE.
 
-@app.get("/api/batch/status", tags=["Batch Processing"])
-async def get_batch_processing_status():
-    """Get current batch processing status and statistics"""
-    try:
-        stats = get_processing_stats()
-        return {
-            "success": True,
-            "stats": stats,
-            "timestamp": now()
-        }
-    except Exception as e:
-        logger.error(f"Error getting batch stats: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error getting batch stats: {str(e)}"
-        )
-
-
-@app.post("/api/batch/process-bulk", tags=["Batch Processing"])
-async def process_bulk_conversations(count: int = 10):
-    """
-    Process multiple conversations in sequence
-    - Processes 'count' conversations one by one
-    - Each is immediately saved to MongoDB
-    - Returns summary of all processed conversations
+    The response contains the message_id so the frontend can correlate the
+    incoming SSE event with this request.
     """
     try:
-        results = []
-        
-        for i in range(count):
-            conversations = get_unprocessed_conversations(limit=1)
-            
-            if not conversations:
-                logger.info(f"Processed {i} conversations - no more data")
-                break
-            
-            conversation = conversations[0]
-            conversation_id = conversation.get("_id") or conversation.get("conversationId", "unknown")
-            
-            # Extract message from activity.text field (your MongoDB structure)
-            prompt = conversation.get("activity", {}).get("text", "")
-            
-            # If no activity.text, try other common fields
-            if not prompt:
-                prompt = conversation.get("message", conversation.get("prompt", ""))
-            
-            logger.info(f"({i+1}/{count}) Processing: {conversation_id}")
-            
-            bot_id = f"batch_processing_{conversation_id}"
-            request_start = time.time()
-            
-            # Load or create security log
-            bot_security_log = load_bot_security_log(bot_id)
-            bot_security_log["total_prompts"] += 1
-            bot_security_log["conversation_id"] = str(conversation_id)
-            
-            # Run security scan
-            loop = asyncio.get_event_loop()
-            scan_results = await loop.run_in_executor(
-                None,
-                detector.scan_prompt_parallel,
-                prompt,
-                bot_id
-            )
-            
-            # Extract results
-            pii_detection = scan_results.detections.get("pii", {})
-            pii_entities = pii_detection.get("entities", [])
-            anonymized_prompt = pii_detection.get("anonymized_prompt", prompt)
-            
-            # Create security event
-            security_event = {
-                "timestamp": now(),
-                "prompt": prompt,
-                "prompt_length": len(prompt),
-                "detections": scan_results.detections,
-                "risk_level": scan_results.risk_level,
-                "is_safe": scan_results.is_safe,
-                "scan_duration": scan_results.scan_duration,
-                "blocked": False,
-                "anonymized_prompt": anonymized_prompt if pii_entities else None,
-                "metrics": {
-                    "request_start_time": request_start,
-                    "scan_time": round(scan_results.scan_duration, 4),
-                    "total_time": round(time.time() - request_start, 4)
-                }
-            }
-            
-            # Update counters
-            if not scan_results.is_safe:
-                bot_security_log["blocked_prompts"] += 1
-                security_event["blocked"] = True
-                security_event["block_reason"] = scan_results.message
-                
-                if scan_results.detections.get("prompt_injection", {}).get("detected"):
-                    bot_security_log["jailbreak_attempts"] += 1
-                if scan_results.detections.get("toxicity", {}).get("detected"):
-                    bot_security_log["toxicity_detections"] += 1
-            
-            if pii_entities:
-                bot_security_log["pii_detections"] += 1
-            
-            # Save to MongoDB immediately
-            bot_security_log["security_events"].append(security_event)
-            bot_security_log["last_updated"] = now()
-            save_bot_security_log(bot_id, bot_security_log)
-            
-            # Mark as processed
-            mark_conversation_processed(conversation_id, bot_id)
-            
-            results.append({
-                "conversation_id": str(conversation_id),
-                "is_safe": scan_results.is_safe,
-                "risk_level": scan_results.risk_level,
-                "scan_duration": round(scan_results.scan_duration, 4)
-            })
-        
-        stats = get_processing_stats()
-        
-        logger.info(f"✅ Batch processing complete - {len(results)} conversations processed")
-        
-        return {
-            "success": True,
-            "count_processed": len(results),
-            "results": results,
-            "processing_stats": stats,
-            "timestamp": now()
-        }
-        
-    except Exception as e:
-        logger.error(f"Error in bulk processing: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error in bulk processing: {str(e)}"
+        # Generate stable IDs
+        ts_ms         = int(time.time() * 1000)
+        message_id    = f"msg_{request.bot_id}_{ts_ms}_{uuid.uuid4().hex[:8]}"
+        conversation_id = f"conv_{request.bot_id}_{ts_ms}"
+        thread_id     = (
+            f"thread_{request.bot_id.split('_')[1]}"
+            if "_" in request.bot_id
+            else f"thread_{request.bot_id}"
+        )
+        user_id = (
+            f"user_{request.bot_id.split('_')[1]}"
+            if "_" in request.bot_id
+            else f"user_{request.bot_id}"
         )
 
-
-
-# ============================================================================
-# SECURITY LOGS ENDPOINTS - Thread and Conversation Management
-# ============================================================================
-
-@app.get("/api/security-logs", tags=["Security Logs"])
-async def get_all_threads(
-    bot_id: Optional[str] = None,
-    skip: int = 0,
-    limit: int = 100
-):
-    """
-    Get all security log threads (users)
-    
-    This reads from the local 'security_logs' folder in the backend.
-    
-    Query Parameters:
-    - bot_id: Filter by specific bot ID (optional)
-    - skip: Pagination offset (default: 0)
-    - limit: Max results (default: 100)
-    """
-    try:
-        threads = []
-        
-        # Scan all thread directories in the local security_logs folder
-        if SECURITY_STORAGE_DIR.exists():
-            for thread_dir in sorted(SECURITY_STORAGE_DIR.iterdir()):
-                if thread_dir.is_dir():
-                    thread_logs = []
-                    
-                    # Scan all conversation logs in this thread
-                    for log_file in sorted(thread_dir.glob("*.json")):
-                        try:
-                            with open(log_file, 'r') as f:
-                                log_data = json.load(f)
-                                log_data["_id"] = str(log_file.stem)
-                                thread_logs.append(log_data)
-                        except Exception as e:
-                            logger.warning(f"Could not read log file {log_file}: {str(e)}")
-                    
-                    # If we have logs and bot_id filter matches (or no filter), include thread
-                    if thread_logs:
-                        thread_bot_id = thread_logs[0].get("bot_id", "")
-                        if bot_id is None or bot_id == thread_bot_id:
-                            threads.append({
-                                "thread_id": thread_dir.name,
-                                "bot_id": thread_bot_id,
-                                "logs": thread_logs,
-                                "last_updated": thread_logs[-1].get("last_updated", now()),
-                                "total_logs": len(thread_logs)
-                            })
-        
-        # Sort by last_updated descending
-        threads = sorted(threads, key=lambda x: x.get("last_updated", ""), reverse=True)
-        
-        # Apply pagination
-        total = len(threads)
-        paginated_threads = threads[skip:skip + limit]
-        
-        logger.info(f"Retrieved {len(paginated_threads)} threads from local folder (total: {total})")
-        
-        return {
-            "threads": paginated_threads,
-            "total": total,
-            "skip": skip,
-            "limit": limit,
-            "timestamp": now()
-        }
-    
-    except Exception as e:
-        logger.error(f"Error fetching threads: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error fetching threads: {str(e)}"
+        ok = insert_test_message(
+            bot_id          = request.bot_id,
+            thread_id       = thread_id,
+            conversation_id = conversation_id,
+            message_id      = message_id,
+            text            = request.prompt,
+            user_id         = user_id,
         )
 
-
-@app.get("/api/security-logs/{thread_id}", tags=["Security Logs"])
-async def get_thread_details(thread_id: str):
-    """
-    Get detailed information for a specific thread
-    
-    Returns complete thread document with all conversations and security events
-    """
-    try:
-        db = get_mongodb()
-        if db is None:
+        if not ok:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="MongoDB not connected"
+                detail="Failed to store message in MongoDB — check DB connection",
             )
-        
-        thread_summaries = db[MONGODB_THREAD_SUMMARIES_COLLECTION]
-        thread = thread_summaries.find_one({"thread_id": thread_id})
-        
-        if not thread:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Thread {thread_id} not found"
-            )
-        
-        # Convert ObjectId to string
-        thread["_id"] = str(thread["_id"])
-        
-        logger.info(f"Retrieved thread: {thread_id}")
-        
-        return thread
-    
+
+        logger.info(
+            f"[test-chat] Stored msg {message_id} for bot {request.bot_id!r} "
+            f"— waiting for monitor to scan"
+        )
+
+        return {
+            "success":         True,
+            "message":         "Message stored. Validation is processing via the real-time monitor.",
+            "message_id":      message_id,
+            "conversation_id": conversation_id,
+            "thread_id":       thread_id,
+            "bot_id":          request.bot_id,
+            "hint":            "Subscribe to /api/monitor/stream to receive the scan result.",
+            "timestamp":       now(),
+        }
+
     except HTTPException:
         raise
-    except Exception as e:
-        logger.error(f"Error fetching thread {thread_id}: {str(e)}")
+    except Exception as exc:
+        logger.error(f"[test-chat] Unexpected error: {exc}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error fetching thread: {str(e)}"
+            detail=f"Internal error: {exc}",
         )
 
-
-@app.get("/api/security-logs/{thread_id}/conversations/{conversation_id}", tags=["Security Logs"])
-async def get_conversation_details(thread_id: str, conversation_id: str):
-    """
-    Get details for a specific conversation within a thread
-    """
-    try:
-        db = get_mongodb()
-        if db is None:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="MongoDB not connected"
-            )
-        
-        thread_summaries = db[MONGODB_THREAD_SUMMARIES_COLLECTION]
-        thread = thread_summaries.find_one(
-            {"thread_id": thread_id},
-            {"conversations": {"$elemMatch": {"conversation_id": conversation_id}}}
-        )
-        
-        if not thread or "conversations" not in thread or len(thread["conversations"]) == 0:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Conversation {conversation_id} not found in thread {thread_id}"
-            )
-        
-        logger.info(f"Retrieved conversation: {conversation_id} from thread: {thread_id}")
-        
-        return thread["conversations"][0]
-    
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error fetching conversation: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error fetching conversation: {str(e)}"
-        )
-
-
-@app.delete("/api/security-logs/{thread_id}", tags=["Security Logs"])
-async def delete_thread(thread_id: str):
-    """
-    Delete a specific thread
-    """
-    try:
-        db = get_mongodb()
-        if db is None:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="MongoDB not connected"
-            )
-        
-        thread_summaries = db[MONGODB_THREAD_SUMMARIES_COLLECTION]
-        result = thread_summaries.delete_one({"thread_id": thread_id})
-        
-        if result.deleted_count == 0:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Thread {thread_id} not found"
-            )
-        
-        logger.info(f"Deleted thread: {thread_id}")
-        
-        return {
-            "deleted": True,
-            "thread_id": thread_id,
-            "timestamp": now()
-        }
-    
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error deleting thread: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error deleting thread: {str(e)}"
-        )
-
-
-@app.get("/api/security-logs/stats/summary", tags=["Security Logs"])
-async def get_threads_statistics(bot_id: Optional[str] = None):
-    """
-    Get aggregate statistics across all threads
-    
-    Reads from local security_logs folder
-    
-    Query Parameters:
-    - bot_id: Filter by specific bot ID (optional)
-    """
-    try:
-        total_threads = 0
-        total_conversations = 0
-        total_prompts = 0
-        total_blocked = 0
-        total_pii = 0
-        total_secrets = 0
-        total_jailbreaks = 0
-        total_toxicity = 0
-        
-        # Scan all thread directories
-        if SECURITY_STORAGE_DIR.exists():
-            for thread_dir in SECURITY_STORAGE_DIR.iterdir():
-                if thread_dir.is_dir():
-                    total_threads += 1
-                    
-                    # Scan all conversation logs in this thread
-                    for log_file in thread_dir.glob("*.json"):
-                        try:
-                            with open(log_file, 'r') as f:
-                                log_data = json.load(f)
-                                
-                                # Check bot_id filter
-                                if bot_id and log_data.get("bot_id") != bot_id:
-                                    continue
-                                
-                                total_conversations += 1
-                                total_prompts += log_data.get("total_prompts", 0)
-                                total_blocked += log_data.get("blocked_prompts", 0)
-                                total_pii += log_data.get("pii_detections", 0)
-                                total_secrets += log_data.get("secrets_detections", 0)
-                                total_jailbreaks += log_data.get("jailbreak_attempts", 0)
-                                total_toxicity += log_data.get("toxicity_detections", 0)
-                        except Exception as e:
-                            logger.warning(f"Could not read log file {log_file}: {str(e)}")
-        
-        logger.info(f"Retrieved statistics for {total_threads} threads from local folder")
-        
-        return {
-            "total_threads": total_threads,
-            "total_conversations": total_conversations,
-            "total_prompts": total_prompts,
-            "total_blocked": total_blocked,
-            "total_pii": total_pii,
-            "total_secrets": total_secrets,
-            "total_jailbreaks": total_jailbreaks,
-            "total_toxicity": total_toxicity,
-            "timestamp": now()
-        }
-    
-    except Exception as e:
-        logger.error(f"Error fetching statistics: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error fetching statistics: {str(e)}"
-        )
-
-
-@app.get("/api/security-logs/search/prompts", tags=["Security Logs"])
-async def search_prompts(
-    query: str,
-    bot_id: Optional[str] = None,
-    limit: int = 100
-):
-    """
-    Search for prompts across all threads and conversations from local folder
-    
-    Query Parameters:
-    - query: Search term (minimum 3 characters)
-    - bot_id: Filter by specific bot ID (optional)
-    - limit: Maximum results to return (default: 100)
-    """
-    try:
-        if len(query) < 3:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Query must be at least 3 characters long"
-            )
-        
-        results = []
-        query_lower = query.lower()
-        
-        # Search in local security logs
-        if SECURITY_STORAGE_DIR.exists():
-            for thread_dir in SECURITY_STORAGE_DIR.iterdir():
-                if thread_dir.is_dir():
-                    for log_file in thread_dir.glob("*.json"):
-                        try:
-                            with open(log_file, 'r') as f:
-                                log_data = json.load(f)
-                                
-                                # Check bot_id filter
-                                if bot_id and log_data.get("bot_id") != bot_id:
-                                    continue
-                                
-                                # Search prompt and anonymized_prompt
-                                if query_lower in log_data.get("prompt", "").lower():
-                                    results.append(log_data)
-                                elif query_lower in log_data.get("anonymized_prompt", "").lower():
-                                    results.append(log_data)
-                                
-                                if len(results) >= limit:
-                                    break
-                        except Exception as e:
-                            logger.warning(f"Could not read log file {log_file}: {str(e)}")
-                    
-                    if len(results) >= limit:
-                        break
-        
-        results = results[:limit]
-        
-        logger.info(f"Found {len(results)} matches for query: '{query}'")
-        
-        return {
-            "results": results,
-            "total_matches": len(results),
-            "query": query,
-            "timestamp": now()
-        }
-    
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error searching prompts: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error searching prompts: {str(e)}"
-        )
-
-
-@app.get("/api/security-logs/threats/top", tags=["Security Logs"])
-async def get_top_threatening_threads(
-    limit: int = 10,
-    bot_id: Optional[str] = None
-):
-    """
-    Get threads with the most security threats from local folder
-    
-    Query Parameters:
-    - limit: Number of threads to return (default: 10)
-    - bot_id: Filter by specific bot ID (optional)
-    """
-    try:
-        threat_threads = []
-        
-        # Scan all thread directories
-        if SECURITY_STORAGE_DIR.exists():
-            for thread_dir in SECURITY_STORAGE_DIR.iterdir():
-                if thread_dir.is_dir():
-                    thread_id = thread_dir.name
-                    thread_threats = {
-                        "thread_id": thread_id,
-                        "pii_detections": 0,
-                        "jailbreak_attempts": 0,
-                        "toxicity_detections": 0,
-                        "secrets_detections": 0,
-                        "total_threats": 0,
-                        "log_count": 0
-                    }
-                    
-                    # Scan all conversation logs in this thread
-                    for log_file in thread_dir.glob("*.json"):
-                        try:
-                            with open(log_file, 'r') as f:
-                                log_data = json.load(f)
-                                
-                                # Check bot_id filter
-                                if bot_id and log_data.get("bot_id") != bot_id:
-                                    continue
-                                
-                                thread_threats["bot_id"] = log_data.get("bot_id", "")
-                                thread_threats["pii_detections"] += log_data.get("pii_detections", 0)
-                                thread_threats["jailbreak_attempts"] += log_data.get("jailbreak_attempts", 0)
-                                thread_threats["toxicity_detections"] += log_data.get("toxicity_detections", 0)
-                                thread_threats["secrets_detections"] += log_data.get("secrets_detections", 0)
-                                thread_threats["log_count"] += 1
-                        except Exception as e:
-                            logger.warning(f"Could not read log file {log_file}: {str(e)}")
-                    
-                    # Calculate total threats
-                    thread_threats["total_threats"] = (
-                        thread_threats["pii_detections"] +
-                        thread_threats["jailbreak_attempts"] +
-                        thread_threats["toxicity_detections"] +
-                        thread_threats["secrets_detections"]
-                    )
-                    
-                    # Only add threads with threats
-                    if thread_threats["total_threats"] > 0:
-                        threat_threads.append(thread_threats)
-        
-        # Sort by total_threats descending
-        threat_threads = sorted(threat_threads, key=lambda x: x["total_threats"], reverse=True)
-        
-        # Limit results
-        threat_threads = threat_threads[:limit]
-        
-        logger.info(f"Retrieved top {len(threat_threads)} threatening threads from local folder")
-        
-        return {
-            "results": threat_threads,
-            "timestamp": now()
-        }
-    
-    except Exception as e:
-        logger.error(f"Error fetching top threats: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error fetching top threats: {str(e)}"
-        )
-
-
-@app.post("/api/security-logs/process", tags=["Security Logs"])
-async def trigger_conversation_processing(
-    bot_id: str,
-    limit: int = 100
-):
-    """
-    Manually trigger conversation processing for a specific bot
-    This does what process_conversations.py does, but via API
-    
-    Use this to process conversations on-demand instead of running the script
-    """
-    try:
-        db = get_mongodb()
-        if db is None:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="MongoDB not connected"
-            )
-        
-        conversations_collection = db[MONGODB_CONVERSATIONS_COLLECTION]
-        security_logs_collection = db[MONGODB_SECURITY_LOGS_COLLECTION]
-        
-        # Get latest conversations for the bot
-        pipeline = [
-            {"$match": {"botId": bot_id}},
-            {"$sort": {"createdAt": -1}},
-            {"$group": {
-                "_id": "$conversationId",
-                "latest_message": {"$first": "$$ROOT"}
-            }},
-            {"$sort": {"latest_message.createdAt": -1}},
-            {"$limit": limit},
-            {"$project": {"_id": 1}}
-        ]
-        
-        conversation_ids = [doc["_id"] for doc in conversations_collection.aggregate(pipeline)]
-        
-        if not conversation_ids:
-            return {
-                "success": True,
-                "message": "No conversations found for this bot",
-                "processed": 0,
-                "timestamp": now()
-            }
-        
-        # Fetch all messages
-        all_messages = list(conversations_collection.find({
-            "botId": bot_id,
-            "conversationId": {"$in": conversation_ids}
-        }).sort("createdAt", 1))
-        
-        # Aggregate by thread
-        threads = {}
-        for msg in all_messages:
-            thread_id = msg.get("threadId")
-            conversation_id = msg.get("conversationId")
-            
-            if thread_id and conversation_id:
-                if thread_id not in threads:
-                    threads[thread_id] = {}
-                if conversation_id not in threads[thread_id]:
-                    threads[thread_id][conversation_id] = []
-                threads[thread_id][conversation_id].append(msg)
-        
-        # Process each thread (simplified version - you'd want to add full validation)
-        processed_count = 0
-        
-        for thread_id, conversations in threads.items():
-            conversation_logs = []
-            
-            for conv_id, messages in conversations.items():
-                sorted_messages = sorted(messages, key=lambda x: x.get("createdAt"))
-                
-                # Simple processing - in production, call your validation logic here
-                security_events = []
-                for msg in sorted_messages:
-                    if msg.get("from", {}).get("role") == "user":
-                        prompt = msg.get("activity", {}).get("text", "")
-                        
-                        # Here you would call: detector.scan_prompt_parallel(prompt, bot_id)
-                        # For now, just store the message
-                        security_events.append({
-                            "timestamp": msg.get("createdAt"),
-                            "message_id": msg.get("messageId"),
-                            "prompt": prompt,
-                            "prompt_length": len(prompt)
-                        })
-                
-                conversation_logs.append({
-                    "conversation_id": conv_id,
-                    "started_at": sorted_messages[0].get("createdAt"),
-                    "ended_at": sorted_messages[-1].get("createdAt"),
-                    "security_events": security_events,
-                    "total_prompts": len(security_events)
-                })
-                
-                processed_count += 1
-            
-            # Save to security_logs
-            thread_document = {
-                "thread_id": thread_id,
-                "bot_id": bot_id,
-                "user_id": all_messages[0].get("userId"),
-                "conversations": conversation_logs,
-                "total_conversations": len(conversation_logs),
-                "last_updated": now()
-            }
-            
-            security_logs_collection.update_one(
-                {"thread_id": thread_id},
-                {"$set": thread_document},
-                upsert=True
-            )
-        
-        logger.info(f"Processed {processed_count} conversations into {len(threads)} threads")
-        
-        return {
-            "success": True,
-            "processed_conversations": processed_count,
-            "processed_threads": len(threads),
-            "bot_id": bot_id,
-            "timestamp": now()
-        }
-    
-    except Exception as e:
-        logger.error(f"Error processing conversations: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error processing conversations: {str(e)}"
-        )
-
-
-@app.get("/api/stats", response_model=StatsResponse, tags=["System"])
-async def get_stats():
-    """Get API statistics and configuration"""
-    return StatsResponse(
-        service="Jailbreak-Protected LLM API (Concurrent Mode)",
-        version="2.0.0",
-        scanners={
-            "prompt_injection": {
-                "name": "Prompt Injection Scanner",
-                "threshold": 0.8,
-                "description": "Detects prompt injection and jailbreak attempts",
-                "concurrent_safe": True
-            },
-            "toxicity": {
-                "name": "Toxicity Scanner",
-                "threshold": 0.5,
-                "description": "Detects toxic and harmful content",
-                "concurrent_safe": True
-            },
-            "pii": {
-                "name": "PII Detection & Anonymization",
-                "threshold": 0.5,
-                "description": "Detects and anonymizes personal information",
-                "concurrent_safe": True
-            },
-            "secrets": {
-                "name": "Secrets Scanner",
-                "threshold": 0.0,
-                "description": "Detects API keys, passwords, and tokens",
-                "concurrent_safe": True
-            }
-            # 🔧 ADD NEW SCANNER INFO FOR API STATS:
-            # Document your new scanners in the /api/stats endpoint
-            # ================================================================
-            # "ban_topics": {
-            #     "name": "Banned Topics Scanner",
-            #     "threshold": 0.7,
-            #     "description": "Blocks specific prohibited topics",
-            #     "concurrent_safe": True
-            # }
-            # ================================================================
-        },
-        models_available=AVAILABLE_MODELS
-    )
 
 # ============================================================================
-# REAL-TIME MONITORING ENDPOINTS (SSE)
+#  REAL-TIME MONITOR — SSE STREAM
+#  Pushes scan events as the monitor processes MongoDB documents.
 # ============================================================================
 
 @app.get("/api/monitor/stream", tags=["Real-Time Monitor"])
 async def stream_monitor():
     """
-    SSE endpoint for real-time conversation monitoring.
+    📡 SSE endpoint — subscribe to receive real-time validation events.
 
-    Connect from frontend:
-        const eventSource = new EventSource('/api/monitor/stream');
-        eventSource.addEventListener('processed', (e) => {
-            const data = JSON.parse(e.data);
-            console.log('Conversation processed:', data);
-        });
+    Frontend usage
+    --------------
+    const es = new EventSource('/api/monitor/stream');
+    es.addEventListener('processed', (e) => {
+        const data = JSON.parse(e.data);
+        // data.message_id, data.is_blocked, data.has_pii, etc.
+    });
+    es.addEventListener('stats',     (e) => { ... });
+    es.addEventListener('error',     (e) => { ... });
     """
     monitor = get_monitor()
     return StreamingResponse(
         monitor.sse_stream(),
         media_type="text/event-stream",
         headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no"
-        }
+            "Cache-Control":    "no-cache",
+            "Connection":       "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
     )
 
 
 @app.get("/api/monitor/status", tags=["Real-Time Monitor"])
 async def get_monitor_status():
-    """Get current monitor status"""
+    """Current monitor statistics."""
     monitor = get_monitor()
     return {
         "running":         monitor.running,
@@ -1375,13 +451,13 @@ async def get_monitor_status():
         "skipped_count":   monitor.skipped_count,
         "error_count":     monitor.error_count,
         "subscribers":     len(monitor._sse_queues),
-        "timestamp":       now()
+        "timestamp":       now(),
     }
 
 
 @app.post("/api/monitor/stop", tags=["Real-Time Monitor"])
 async def stop_monitor():
-    """Stop the real-time monitor"""
+    """Stop the real-time monitor (admin use)."""
     monitor = get_monitor()
     monitor.stop()
     return {
@@ -1389,116 +465,798 @@ async def stop_monitor():
         "message":         "Monitor stopped",
         "processed_count": monitor.processed_count,
         "error_count":     monitor.error_count,
-        "timestamp":       now()
+        "timestamp":       now(),
+    }
+
+
+@app.get("/api/admin/diagnose", tags=["Admin"])
+async def diagnose_unprocessed():
+    """
+    🔍 Show exactly why unprocessed docs are being skipped.
+    Run this when backfill shows 0/N scanned.
+    """
+    db = get_mongodb()
+    if db is None:
+        raise HTTPException(status_code=503, detail="MongoDB not connected")
+
+    col = db[MONGODB_CONVERSATIONS_COLLECTION]
+    docs = list(col.find({"processed": {"$ne": True}}).limit(20))
+
+    results = []
+    monitor = get_monitor()
+    for doc in docs:
+        report = monitor.diagnose_document(doc)
+        # Keep only the fields useful for diagnosis
+        results.append({
+            "messageId":      doc.get("messageId"),
+            "botId":          doc.get("botId"),
+            "threadId":       doc.get("threadId"),
+            "conversationId": doc.get("conversationId"),
+            "from_role":      doc.get("from", {}).get("role"),
+            "processed":      doc.get("processed"),
+            "text_preview":   (doc.get("activity", {}).get("text") or "")[:60],
+            "verdict":        report.get("verdict"),
+            "checks":         report.get("checks"),
+        })
+
+    return {
+        "total_unprocessed": len(docs),
+        "results": results,
+        "timestamp": now(),
+    }
+
+
+async def fix_indexes():
+    """
+    🔧 Drop and recreate all MongoDB indexes cleanly.
+    Run this once if you see IndexKeySpecsConflict errors on startup.
+    """
+    db = get_mongodb()
+    if db is None:
+        raise HTTPException(status_code=503, detail="MongoDB not connected")
+
+    col = db[MONGODB_CONVERSATIONS_COLLECTION]
+    dropped = []
+    errors  = []
+
+    # Drop every index except the immutable _id index
+    try:
+        existing = [idx["name"] for idx in col.list_indexes() if idx["name"] != "_id_"]
+        for name in existing:
+            try:
+                col.drop_index(name)
+                dropped.append(name)
+                logger.info(f"[fix-indexes] Dropped: {name}")
+            except Exception as e:
+                errors.append({"index": name, "error": str(e)})
+                logger.warning(f"[fix-indexes] Could not drop {name}: {e}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not list indexes: {e}")
+
+    # Recreate the correct set
+    from pymongo import ASCENDING, DESCENDING
+    created = []
+    specs = [
+        ("conversationId", {}),
+        ("messageId",      {"unique": True, "sparse": True}),
+        ("botId",          {}),
+        ("threadId",       {}),
+        ([("createdAt", DESCENDING)], {}),
+        ("processed",      {}),
+    ]
+    for keys, kwargs in specs:
+        try:
+            col.create_index(keys, **kwargs)
+            created.append(str(keys))
+        except Exception as e:
+            errors.append({"index": str(keys), "error": str(e)})
+            logger.warning(f"[fix-indexes] Could not create {keys}: {e}")
+
+    return {
+        "success": len(errors) == 0,
+        "dropped": dropped,
+        "created": created,
+        "errors":  errors,
+        "message": "Indexes fixed. Restart the server to apply the backfill." if not errors else "Some errors occurred — see 'errors' field.",
+        "timestamp": now(),
     }
 
 
 # ============================================================================
-# LOCAL SECURITY LOGS ENDPOINTS
+#  CONVERSATION ENDPOINTS  ← ALL DATA FROM MONGODB ONLY
 # ============================================================================
 
-@app.get("/api/security-logs/local", tags=["Security Logs"])
-async def get_local_security_logs():
+@app.get("/api/conversations", tags=["Conversations"])
+async def list_conversations(
+    bot_id:      Optional[str] = Query(None, description="Filter by bot ID"),
+    thread_id:   Optional[str] = Query(None, description="Filter by thread ID"),
+    role:        Optional[str] = Query(None, description="Filter by from.role (e.g. 'user')"),
+    unprocessed: bool           = Query(False, description="Only return unprocessed messages"),
+    skip:        int            = Query(0, ge=0),
+    limit:       int            = Query(50, ge=1, le=500),
+):
     """
-    Get all security logs from local JSON files.
-    This is what the dashboard reads from.
+    📦 Fetch conversations from MongoDB.
+
+    All filtering / pagination is done server-side via fetch_conversations().
+    """
+    result = fetch_conversations(
+        bot_id           = bot_id,
+        thread_id        = thread_id,
+        role             = role,
+        only_unprocessed = unprocessed,
+        skip             = skip,
+        limit            = limit,
+    )
+    return {"success": True, **result}
+
+
+@app.get("/api/conversations/{conversation_id}", tags=["Conversations"])
+async def get_conversation(conversation_id: str):
+    """
+    Fetch a single conversation document from MongoDB by its conversationId.
+    """
+    result = fetch_conversations(conversation_id=conversation_id, limit=1)
+    docs = result.get("conversations", [])
+    if not docs:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Conversation '{conversation_id}' not found",
+        )
+    return {"success": True, "conversation": docs[0], "timestamp": now()}
+
+
+@app.get("/api/conversations/bot/{bot_id}", tags=["Conversations"])
+async def get_bot_conversations(
+    bot_id:    str,
+    thread_id: Optional[str] = Query(None),
+    skip:      int            = Query(0, ge=0),
+    limit:     int            = Query(50, ge=1, le=500),
+):
+    """
+    Fetch all conversations for a specific bot from MongoDB.
+    Optionally filter by thread_id.
+    """
+    result = fetch_conversations(
+        bot_id    = bot_id,
+        thread_id = thread_id,
+        skip      = skip,
+        limit     = limit,
+    )
+    return {"success": True, "bot_id": bot_id, **result}
+
+
+@app.get("/api/conversations/thread/{thread_id}", tags=["Conversations"])
+async def get_thread_conversations(
+    thread_id: str,
+    skip:  int = Query(0, ge=0),
+    limit: int = Query(100, ge=1, le=500),
+):
+    """
+    Fetch all messages belonging to a thread from MongoDB.
+    """
+    result = fetch_conversations(thread_id=thread_id, skip=skip, limit=limit)
+    return {"success": True, "thread_id": thread_id, **result}
+
+
+@app.get("/api/conversations/message/{message_id}", tags=["Conversations"])
+async def get_message(message_id: str):
+    """
+    Fetch a single message document from MongoDB by messageId.
+    """
+    result = fetch_conversations(message_id=message_id, limit=1)
+    docs = result.get("conversations", [])
+    if not docs:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Message '{message_id}' not found",
+        )
+    return {"success": True, "message": docs[0], "timestamp": now()}
+
+
+# ============================================================================
+#  SECURITY LOG ENDPOINTS  ← ALL DATA FROM LOCAL JSON FILES ONLY
+# ============================================================================
+
+@app.get("/api/security-logs", tags=["Security Logs"])
+async def get_all_security_logs(
+    bot_id: Optional[str] = Query(None),
+    skip:   int           = Query(0, ge=0),
+    limit:  int           = Query(100, ge=1, le=1000),
+):
+    """
+    📂 Read all security logs from local ``security_logs/`` folder.
+
+    Each file = one bot's aggregated scan results.  The frontend should call
+    this endpoint (not MongoDB) for all validation / threat details.
     """
     logs = []
 
-    for log_file in SECURITY_STORAGE_DIR.glob("*.json"):
-        # Skip the hidden resume token file
-        if log_file.name.startswith("."):
+    SECURITY_STORAGE_DIR.mkdir(exist_ok=True)
+    for log_file in sorted(SECURITY_STORAGE_DIR.glob("*.json")):
+        if log_file.name.startswith("."):          # skip .resume_token.json
             continue
-        with open(log_file, 'r') as f:
-            logs.append(json.load(f))
+        try:
+            with open(log_file) as f:
+                data = json.load(f)
+            if bot_id and data.get("bot_id") != bot_id:
+                continue
+            logs.append(data)
+        except Exception as exc:
+            logger.warning(f"Could not read {log_file}: {exc}")
 
-    total_stats = {
-        "totalConversations": len(logs),
-        "totalPrompts":       sum(log.get("total_prompts", 0)       for log in logs),
-        "totalBlocked":       sum(log.get("blocked_prompts", 0)     for log in logs),
-        "totalPII":           sum(log.get("pii_detections", 0)      for log in logs),
-        "totalJailbreaks":    sum(log.get("jailbreak_attempts", 0)  for log in logs),
-        "totalToxicity":      sum(log.get("toxicity_detections", 0) for log in logs),
-        "totalSecrets":       sum(log.get("secrets_detections", 0)  for log in logs),
-    }
+    total         = len(logs)
+    paginated     = logs[skip: skip + limit]
+    total_prompts = sum(lg.get("total_prompts",       0) for lg in logs)
+    total_blocked = sum(lg.get("blocked_prompts",     0) for lg in logs)
+    total_pii     = sum(lg.get("pii_detections",      0) for lg in logs)
+    total_jb      = sum(lg.get("jailbreak_attempts",  0) for lg in logs)
+    total_tox     = sum(lg.get("toxicity_detections", 0) for lg in logs)
+    total_sec     = sum(lg.get("secrets_detections",  0) for lg in logs)
 
     return {
-        "success":   True,
-        "sessions":  logs,   # "sessions" key keeps dashboard compatibility
-        "stats":     total_stats,
-        "timestamp": now()
+        "success":  True,
+        "sessions": paginated,
+        "total":    total,
+        "skip":     skip,
+        "limit":    limit,
+        "stats": {
+            "totalConversations": total,
+            "totalPrompts":   total_prompts,
+            "totalBlocked":   total_blocked,
+            "totalPII":       total_pii,
+            "totalJailbreaks": total_jb,
+            "totalToxicity":  total_tox,
+            "totalSecrets":   total_sec,
+        },
+        "timestamp": now(),
     }
 
 
-@app.get("/api/security-logs/local/{bot_id}", tags=["Security Logs"])
-async def get_local_security_log(bot_id: str):
-    """Get the security log for a specific bot"""
-    log_path = SECURITY_STORAGE_DIR / f"{bot_id}.json"
+@app.get("/api/security-logs/local", tags=["Security Logs"])
+async def get_local_security_logs_alias(
+    bot_id: Optional[str] = Query(None),
+    skip:   int           = Query(0, ge=0),
+    limit:  int           = Query(100, ge=1, le=1000),
+):
+    """Alias for /api/security-logs — kept for backward compatibility."""
+    return await get_all_security_logs(bot_id=bot_id, skip=skip, limit=limit)
 
+
+@app.get("/api/security-logs/stats/summary", tags=["Security Logs"])
+async def get_security_stats_summary(bot_id: Optional[str] = Query(None)):
+    """Aggregate statistics across all local security-log files."""
+    totals = {
+        "total_bots": 0,
+        "total_prompts": 0,
+        "total_blocked": 0,
+        "total_pii": 0,
+        "total_secrets": 0,
+        "total_jailbreaks": 0,
+        "total_toxicity": 0,
+    }
+
+    for log_file in SECURITY_STORAGE_DIR.glob("*.json"):
+        if log_file.name.startswith("."):
+            continue
+        try:
+            with open(log_file) as f:
+                data = json.load(f)
+            if bot_id and data.get("bot_id") != bot_id:
+                continue
+            totals["total_bots"]       += 1
+            totals["total_prompts"]    += data.get("total_prompts",       0)
+            totals["total_blocked"]    += data.get("blocked_prompts",     0)
+            totals["total_pii"]        += data.get("pii_detections",      0)
+            totals["total_secrets"]    += data.get("secrets_detections",  0)
+            totals["total_jailbreaks"] += data.get("jailbreak_attempts",  0)
+            totals["total_toxicity"]   += data.get("toxicity_detections", 0)
+        except Exception as exc:
+            logger.warning(f"Could not read {log_file}: {exc}")
+
+    return {**totals, "timestamp": now()}
+
+
+@app.get("/api/security-logs/{bot_id}", tags=["Security Logs"])
+async def get_bot_security_log(bot_id: str):
+    """Read the security log for a specific bot from local JSON."""
+    log_path = SECURITY_STORAGE_DIR / f"{bot_id}.json"
     if not log_path.exists():
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"No security log found for bot_id: {bot_id}"
+            detail=f"No security log found for bot_id: {bot_id}",
         )
+    with open(log_path) as f:
+        data = json.load(f)
+    return {"success": True, "log": data, "timestamp": now()}
 
-    with open(log_path, 'r') as f:
-        log_data = json.load(f)
 
-    return {"success": True, "log": log_data, "timestamp": now()}
+@app.get("/api/security-logs/{bot_id}/summary", tags=["Security Logs"])
+async def get_bot_security_summary(bot_id: str):
+    """Statistics summary for one bot from local JSON."""
+    log_path = SECURITY_STORAGE_DIR / f"{bot_id}.json"
+    if not log_path.exists():
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No security log found for bot_id: {bot_id}",
+        )
+    with open(log_path) as f:
+        data = json.load(f)
+    return {
+        "bot_id":     data.get("bot_id"),
+        "created_at": data.get("created_at"),
+        "last_updated": data.get("last_updated"),
+        "statistics": {
+            "total_prompts":       data.get("total_prompts",       0),
+            "blocked_prompts":     data.get("blocked_prompts",     0),
+            "pii_detections":      data.get("pii_detections",      0),
+            "jailbreak_attempts":  data.get("jailbreak_attempts",  0),
+            "toxicity_detections": data.get("toxicity_detections", 0),
+            "secrets_detections":  data.get("secrets_detections",  0),
+            "total_events":        len(data.get("security_events", [])),
+        },
+    }
+
+
+@app.get("/api/security-logs/{bot_id}/pii", tags=["Security Logs"])
+async def get_bot_pii_events(bot_id: str):
+    """Return only PII-flagged events for a bot from local JSON."""
+    log_path = SECURITY_STORAGE_DIR / f"{bot_id}.json"
+    if not log_path.exists():
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No security log found for bot_id: {bot_id}",
+        )
+    with open(log_path) as f:
+        data = json.load(f)
+    pii_events = [
+        ev for ev in data.get("security_events", [])
+        if ev.get("detections", {}).get("pii", {}).get("detected", False)
+    ]
+    return {
+        "bot_id":              bot_id,
+        "pii_detection_count": len(pii_events),
+        "pii_events":          pii_events,
+    }
+
+
+@app.delete("/api/security-logs/{bot_id}", tags=["Security Logs"])
+async def delete_bot_security_log(bot_id: str):
+    """Delete the local security log for a bot."""
+    log_path = SECURITY_STORAGE_DIR / f"{bot_id}.json"
+    if not log_path.exists():
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No security log found for bot_id: {bot_id}",
+        )
+    log_path.unlink()
+    return {"success": True, "message": f"Deleted security log for {bot_id}", "timestamp": now()}
+
+
+@app.get("/api/security-logs/search/prompts", tags=["Security Logs"])
+async def search_prompts(
+    query:  str            = Query(..., min_length=3),
+    bot_id: Optional[str] = Query(None),
+    limit:  int            = Query(100, ge=1, le=500),
+):
+    """Full-text search over local security-log event prompts."""
+    results = []
+    q = query.lower()
+
+    for log_file in SECURITY_STORAGE_DIR.glob("*.json"):
+        if log_file.name.startswith(".") or len(results) >= limit:
+            break
+        try:
+            with open(log_file) as f:
+                data = json.load(f)
+            if bot_id and data.get("bot_id") != bot_id:
+                continue
+            for ev in data.get("security_events", []):
+                if q in ev.get("prompt", "").lower() or q in (ev.get("anonymized_prompt") or "").lower():
+                    results.append(ev)
+                    if len(results) >= limit:
+                        break
+        except Exception as exc:
+            logger.warning(f"Could not read {log_file}: {exc}")
+
+    return {
+        "results":       results[:limit],
+        "total_matches": len(results),
+        "query":         query,
+        "timestamp":     now(),
+    }
+
+
+@app.get("/api/security-logs/threats/top", tags=["Security Logs"])
+async def get_top_threatening_bots(
+    limit:  int            = Query(10, ge=1, le=100),
+    bot_id: Optional[str] = Query(None),
+):
+    """Return bots with the most threat events (from local JSON)."""
+    threats = []
+
+    for log_file in SECURITY_STORAGE_DIR.glob("*.json"):
+        if log_file.name.startswith("."):
+            continue
+        try:
+            with open(log_file) as f:
+                data = json.load(f)
+            if bot_id and data.get("bot_id") != bot_id:
+                continue
+            pii  = data.get("pii_detections",      0)
+            jb   = data.get("jailbreak_attempts",  0)
+            tox  = data.get("toxicity_detections", 0)
+            sec  = data.get("secrets_detections",  0)
+            total = pii + jb + tox + sec
+            if total > 0:
+                threats.append({
+                    "bot_id":              data.get("bot_id"),
+                    "pii_detections":      pii,
+                    "jailbreak_attempts":  jb,
+                    "toxicity_detections": tox,
+                    "secrets_detections":  sec,
+                    "total_threats":       total,
+                })
+        except Exception as exc:
+            logger.warning(f"Could not read {log_file}: {exc}")
+
+    threats.sort(key=lambda x: x["total_threats"], reverse=True)
+    return {"results": threats[:limit], "timestamp": now()}
 
 
 # ============================================================================
-# STARTUP / SHUTDOWN
+#  LEGACY ALIASES  — keep old URLs working while dashboard migrates
 # ============================================================================
+
+@app.get("/api/security", tags=["Security Logs"])
+async def legacy_security_alias(
+    bot_id: Optional[str] = Query(None),
+    skip:   int           = Query(0, ge=0),
+    limit:  int           = Query(100, ge=1, le=1000),
+):
+    """Alias for /api/security-logs — kept for backward compatibility."""
+    return await get_all_security_logs(bot_id=bot_id, skip=skip, limit=limit)
+
+
+@app.get("/api/security/{bot_id}", tags=["Security Logs"])
+async def legacy_security_bot_alias(bot_id: str):
+    """Alias for /api/security-logs/{bot_id} — kept for backward compatibility."""
+    return await get_bot_security_log(bot_id=bot_id)
+
+
+# ============================================================================
+#  SCAN-ONLY ENDPOINT  (direct scan — does NOT write to MongoDB or local JSON)
+# ============================================================================
+
+@app.post("/api/scan", response_model=SecurityScanResult, tags=["Security"])
+async def scan_only(request: ScanRequest):
+    """
+    Scan a single prompt with all security checks and return results inline.
+    Nothing is persisted — useful for ad-hoc testing.
+    """
+    try:
+        loop = asyncio.get_event_loop()
+        scan_results = await loop.run_in_executor(
+            None, detector.scan_prompt_parallel, request.prompt, "scan-only"
+        )
+        return scan_results
+    except Exception as exc:
+        logger.error(f"Scan error: {exc}")
+        raise HTTPException(status_code=500, detail=f"Scan failed: {exc}")
+
+
+# ============================================================================
+#  BATCH PROCESSING ENDPOINTS
+#  Fetches unprocessed docs from MongoDB, scans, saves to local JSON.
+# ============================================================================
+
+@app.post("/api/batch/process-next", tags=["Batch Processing"])
+async def process_next_conversation():
+    """
+    Process the next unprocessed conversation from MongoDB.
+    Scans it and stores the result in security_logs/{bot_id}.json.
+    """
+    from storage import append_security_event
+
+    conversations = get_unprocessed_conversations(limit=1)
+    if not conversations:
+        return {"success": False, "message": "No more conversations to process", "processed": False}
+
+    conversation    = conversations[0]
+    conversation_id = str(conversation.get("_id") or conversation.get("conversationId", "unknown"))
+    prompt          = conversation.get("activity", {}).get("text", "") or conversation.get("message", "")
+    bot_id          = conversation.get("botId") or f"batch_{conversation_id}"
+    thread_id       = conversation.get("threadId", "unknown")
+    message_id      = conversation.get("messageId") or conversation_id
+
+    if not prompt:
+        return {"success": False, "message": "Empty prompt — skipping", "conversation_id": conversation_id}
+
+    loop          = asyncio.get_event_loop()
+    request_start = time.time()
+    scan_results  = await loop.run_in_executor(None, detector.scan_prompt_parallel, prompt, bot_id)
+
+    pii_data      = scan_results.detections.get("pii", {})
+    pii_entities  = pii_data.get("entities", [])
+    has_pii       = bool(pii_entities)
+    has_jailbreak = scan_results.detections.get("prompt_injection", {}).get("detected", False)
+    has_toxicity  = scan_results.detections.get("toxicity", {}).get("detected", False)
+    has_secrets   = pii_data.get("secrets_detected", False)
+    is_blocked    = not scan_results.is_safe
+
+    security_event = {
+        "message_id":        message_id,
+        "thread_id":         thread_id,
+        "conversation_id":   conversation_id,
+        "bot_id":            bot_id,
+        "timestamp":         now(),
+        "prompt":            prompt,
+        "prompt_length":     len(prompt),
+        "anonymized_prompt": pii_data.get("anonymized_prompt") if pii_entities else None,
+        "detections":        scan_results.detections,
+        "risk_level":        scan_results.risk_level,
+        "is_safe":           scan_results.is_safe,
+        "blocked":           is_blocked,
+        "block_reason":      scan_results.message if is_blocked else None,
+        "scan_duration":     round(scan_results.scan_duration, 4),
+        "metrics": {
+            "scan_time":   round(scan_results.scan_duration, 4),
+            "total_time":  round(time.time() - request_start, 4),
+        },
+    }
+
+    append_security_event(
+        bot_id        = bot_id,
+        message_id    = message_id,
+        security_event = security_event,
+        is_blocked    = is_blocked,
+        has_pii       = has_pii,
+        has_jailbreak = has_jailbreak,
+        has_toxicity  = has_toxicity,
+        has_secrets   = has_secrets,
+    )
+    mark_conversation_processed(conversation_id, bot_id)
+
+    return {
+        "success":         True,
+        "processed":       True,
+        "conversation_id": conversation_id,
+        "security_log_id": bot_id,
+        "scan_results": {
+            "is_safe":        scan_results.is_safe,
+            "risk_level":     scan_results.risk_level,
+            "pii_detected":   has_pii,
+            "threat_detected": is_blocked,
+            "scan_duration":  round(scan_results.scan_duration, 4),
+            "message":        scan_results.message,
+        },
+        "processing_stats": get_processing_stats(),
+        "timestamp":        now(),
+    }
+
+
+@app.post("/api/batch/process-bulk", tags=["Batch Processing"])
+async def process_bulk_conversations(count: int = Query(10, ge=1, le=200)):
+    """Process up to *count* unprocessed conversations in sequence."""
+    from storage import append_security_event
+
+    results = []
+
+    for i in range(count):
+        conversations = get_unprocessed_conversations(limit=1)
+        if not conversations:
+            logger.info(f"Batch done after {i} — no more data")
+            break
+
+        conversation    = conversations[0]
+        conversation_id = str(conversation.get("_id") or conversation.get("conversationId", "unknown"))
+        prompt          = conversation.get("activity", {}).get("text", "") or conversation.get("message", "")
+        bot_id          = conversation.get("botId") or f"batch_{conversation_id}"
+        thread_id       = conversation.get("threadId", "unknown")
+        message_id      = conversation.get("messageId") or conversation_id
+
+        if not prompt:
+            mark_conversation_processed(conversation_id, bot_id)
+            continue
+
+        loop          = asyncio.get_event_loop()
+        request_start = time.time()
+        scan_results  = await loop.run_in_executor(None, detector.scan_prompt_parallel, prompt, bot_id)
+
+        pii_data      = scan_results.detections.get("pii", {})
+        pii_entities  = pii_data.get("entities", [])
+        has_pii       = bool(pii_entities)
+        has_jailbreak = scan_results.detections.get("prompt_injection", {}).get("detected", False)
+        has_toxicity  = scan_results.detections.get("toxicity", {}).get("detected", False)
+        has_secrets   = pii_data.get("secrets_detected", False)
+        is_blocked    = not scan_results.is_safe
+
+        security_event = {
+            "message_id":        message_id,
+            "thread_id":         thread_id,
+            "conversation_id":   conversation_id,
+            "bot_id":            bot_id,
+            "timestamp":         now(),
+            "prompt":            prompt,
+            "prompt_length":     len(prompt),
+            "anonymized_prompt": pii_data.get("anonymized_prompt") if pii_entities else None,
+            "detections":        scan_results.detections,
+            "risk_level":        scan_results.risk_level,
+            "is_safe":           scan_results.is_safe,
+            "blocked":           is_blocked,
+            "block_reason":      scan_results.message if is_blocked else None,
+            "scan_duration":     round(scan_results.scan_duration, 4),
+            "metrics": {
+                "scan_time":  round(scan_results.scan_duration, 4),
+                "total_time": round(time.time() - request_start, 4),
+            },
+        }
+
+        append_security_event(
+            bot_id         = bot_id,
+            message_id     = message_id,
+            security_event = security_event,
+            is_blocked     = is_blocked,
+            has_pii        = has_pii,
+            has_jailbreak  = has_jailbreak,
+            has_toxicity   = has_toxicity,
+            has_secrets    = has_secrets,
+        )
+        mark_conversation_processed(conversation_id, bot_id)
+
+        results.append({
+            "conversation_id": conversation_id,
+            "is_safe":         scan_results.is_safe,
+            "risk_level":      scan_results.risk_level,
+            "scan_duration":   round(scan_results.scan_duration, 4),
+        })
+
+    return {
+        "success":          True,
+        "count_processed":  len(results),
+        "results":          results,
+        "processing_stats": get_processing_stats(),
+        "timestamp":        now(),
+    }
+
+
+@app.get("/api/batch/status", tags=["Batch Processing"])
+async def get_batch_status():
+    """Current batch processing statistics from MongoDB."""
+    return {"success": True, "stats": get_processing_stats(), "timestamp": now()}
+
+
+# ============================================================================
+#  STATS
+# ============================================================================
+
+@app.get("/api/stats", response_model=StatsResponse, tags=["System"])
+async def get_stats():
+    return StatsResponse(
+        service="Guardrail Cloud Service",
+        version="2.0.0",
+        scanners={
+            "prompt_injection": {
+                "name": "Prompt Injection Scanner",
+                "threshold": 0.8,
+                "description": "Detects prompt injection and jailbreak attempts",
+                "concurrent_safe": True,
+            },
+            "toxicity": {
+                "name": "Toxicity Scanner",
+                "threshold": 0.5,
+                "description": "Detects toxic and harmful content",
+                "concurrent_safe": True,
+            },
+            "pii": {
+                "name": "PII Detection & Anonymization",
+                "threshold": 0.5,
+                "description": "Detects and anonymizes personal information",
+                "concurrent_safe": True,
+            },
+            "secrets": {
+                "name": "Secrets Scanner",
+                "threshold": 0.0,
+                "description": "Detects API keys, passwords, and tokens",
+                "concurrent_safe": True,
+            },
+        },
+        models_available=AVAILABLE_MODELS,
+    )
+
+
+# ============================================================================
+#  STARTUP / SHUTDOWN
+# ============================================================================
+
+async def _backfill_unprocessed():
+    """
+    On startup, scan any messages that were inserted into MongoDB before
+    the Change Stream opened (e.g. from previous server runs).
+    Runs once as a background task after a short delay to let the monitor connect.
+    After scanning each doc, marks it processed=True in MongoDB so it won't
+    be picked up again on the next server restart.
+    """
+    await asyncio.sleep(5)          # wait for monitor Change Stream to open
+    logger.info("🔄  Backfill: checking for unprocessed messages...")
+
+    try:
+        db = get_mongodb()
+        if db is None:
+            logger.warning("Backfill skipped — MongoDB not connected")
+            return
+
+        collection = db[MONGODB_CONVERSATIONS_COLLECTION]
+        # Only user messages that haven't been processed
+        unprocessed = list(collection.find({
+            "processed": {"$ne": True},
+            "from.role": "user"
+        }).limit(500))
+
+        if not unprocessed:
+            logger.info("🔄  Backfill: nothing to process")
+            return
+
+        logger.info(f"🔄  Backfill: found {len(unprocessed)} unprocessed user messages")
+
+        mon = get_monitor()
+        processed = 0
+        for doc in unprocessed:
+            try:
+                result = mon.process_message(doc)
+                if not result.get("skipped"):
+                    processed += 1
+                    # ── Mark processed in MongoDB so it won't be backfilled again ──
+                    msg_id = doc.get("messageId") or doc.get("message_id")
+                    if msg_id:
+                        mark_conversation_processed(msg_id)
+            except Exception as exc:
+                logger.error(f"Backfill error on {doc.get('messageId')}: {exc}")
+
+        logger.info(f"✅  Backfill complete — {processed}/{len(unprocessed)} messages scanned")
+
+    except Exception as exc:
+        logger.error(f"Backfill failed: {exc}")
+
 
 @app.on_event("startup")
 async def startup_event():
-    """Log startup information, initialize MongoDB, and launch the monitor."""
-    logger.info("=" * 80)
-    logger.info("🚀 Starting Jailbreak-Protected LLM API - ⚡ CONCURRENT MODE ⚡")
-    logger.info("=" * 80)
+    logger.info("=" * 70)
+    logger.info("🚀  Guardrail Cloud Service — starting up")
+    logger.info("=" * 70)
 
-    # Launch real-time monitor as a background task — runs for the life of the server
+    # MongoDB connection (shared module)
+    logger.info("🔌  Connecting to MongoDB …")
+    if connect_mongodb():
+        logger.info("✅  MongoDB connected")
+    else:
+        logger.warning("⚠️   MongoDB unavailable — test-chat and conversation endpoints will fail")
+
+    # Launch the real-time monitor (runs forever as a background task)
     monitor = get_monitor()
     asyncio.create_task(monitor.run_forever())
-    logger.info("📡 Real-time monitor background task launched")
+    logger.info("📡  Real-time monitor background task launched")
 
-    # Initialize MongoDB connection
-    logger.info("🔌 Initializing MongoDB connection...")
-    if connect_mongodb():
-        logger.info("✓ MongoDB connected successfully")
-    else:
-        logger.warning("⚠️  Failed to connect to MongoDB - using fallback mode")
+    # Polling loop handles all unprocessed messages — no separate backfill needed
 
-    logger.info("✓ Loaded security scanners:")
-    logger.info("  - Prompt Injection Scanner")
-    logger.info("  - Toxicity Scanner")
-    logger.info("  - PII Detection & Anonymization (includes Secrets)")
-    logger.info("✓ Thread-safe PII scanner with isolated instances")
-    logger.info("✓ READY FOR CONCURRENT BOT SIMULATION")
-    logger.info("=" * 80)
-    logger.info("⚡ Can handle 50+ bots simultaneously! ⚡")
-    logger.info("=" * 80 + "\n")
+    logger.info("✅  Security scanners: Prompt Injection | Toxicity | PII | Secrets")
+    logger.info("=" * 70)
 
     if not OPENROUTER_API_KEY:
-        logger.warning("⚠️  OPENROUTER_API_KEY not set! Set it as environment variable.")
+        logger.warning("⚠️   OPENROUTER_API_KEY not set")
 
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    """Graceful shutdown — stop scanner, monitor, and MongoDB."""
     shutdown_scanner()
     shutdown_monitor()
     close_mongodb()
 
+
+# ============================================================================
+#  ENTRYPOINT
+# ============================================================================
+
 if __name__ == "__main__":
     import uvicorn
-    
-    uvicorn.run(
-        "main:app",
-        host="0.0.0.0",
-        port=8000,
-        reload=False,
-        log_level="info",
-        workers=1
-    )
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False, workers=1)

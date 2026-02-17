@@ -5,6 +5,19 @@ Centralized configuration for the Guardrail Cloud Service
 import os
 from pathlib import Path
 
+# Load .env file automatically — searches current dir and all parent dirs
+# so it works whether uvicorn is launched from /backend or the project root.
+try:
+    from dotenv import load_dotenv, find_dotenv
+    _env_file = find_dotenv(usecwd=True)
+    if _env_file:
+        load_dotenv(_env_file, override=True)
+        print(f"[config] Loaded .env from: {_env_file}")
+    else:
+        print("[config] No .env file found — relying on system environment variables")
+except ImportError:
+    print("[config] python-dotenv not installed — run: pip install python-dotenv")
+
 # ============================================================================
 # MongoDB Configuration - CUSTOMIZE HERE
 # ============================================================================
