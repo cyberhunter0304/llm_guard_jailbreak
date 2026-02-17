@@ -5,18 +5,55 @@ Centralized configuration for the Guardrail Cloud Service
 import os
 from pathlib import Path
 
-# MongoDB Configuration
-MONGODB_URI = os.getenv("MONGODB_URI", "mongodb://localhost:27017/")
-MONGODB_DATABASE = os.getenv("MONGODB_DATABASE", "guardrails_dev")
-MONGODB_SECURITY_LOGS_COLLECTION = "security_logs"  # Individual security events
-MONGODB_CONVERSATIONS_COLLECTION = "conversations"
-MONGODB_THREAD_SUMMARIES_COLLECTION = "thread_summaries"  # Aggregated thread data
+# ============================================================================
+# MongoDB Configuration - CUSTOMIZE HERE
+# ============================================================================
 
-# Security Storage (Deprecated - using MongoDB now)
+# MongoDB Connection URI
+# Examples:
+# - Local: "mongodb://localhost:27017/"
+# - Atlas: "mongodb+srv://user:password@cluster.mongodb.net/"
+# - Replica Set: "mongodb://host1:27017,host2:27017,host3:27017/?replicaSet=rs0"
+MONGODB_URI = os.getenv("MONGODB_URI")
+MONGODB_DATABASE = os.getenv("MONGODB_DATABASE")
+
+# Warn loudly at import time if the required env vars are missing
+import warnings as _warnings
+if not MONGODB_URI:
+    _warnings.warn(
+        "MONGODB_URI environment variable is not set. "
+        "MongoDB features will fail. Add it to your .env file.",
+        RuntimeWarning,
+        stacklevel=2,
+    )
+if not MONGODB_DATABASE:
+    _warnings.warn(
+        "MONGODB_DATABASE environment variable is not set. "
+        "MongoDB features will fail. Add it to your .env file.",
+        RuntimeWarning,
+        stacklevel=2,
+    )
+
+# Collection Names
+# The external app writes to this collection:
+MONGODB_CONVERSATIONS_COLLECTION = "messages"
+
+# Internal collections (security results and thread summaries)
+MONGODB_SECURITY_LOGS_COLLECTION = "security_logs"
+MONGODB_THREAD_SUMMARIES_COLLECTION = "thread_summaries"
+
+# ============================================================================
+# Local Storage Configuration
+# ============================================================================
+
+# Directory for storing security logs as JSON files
 SECURITY_STORAGE_DIR = Path("security_logs")
 SECURITY_STORAGE_DIR.mkdir(exist_ok=True)
 
+# ============================================================================
 # LLM Provider Configuration
+# ============================================================================
+
 # Choose provider: "openrouter" or "azure"
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "openrouter")
 
@@ -31,7 +68,10 @@ AZURE_DEPLOYMENT = os.getenv("AZURE_DEPLOYMENT", "gpt-4-turbo")  # Deployment na
 AZURE_PROJECT_ID = os.getenv("AZURE_PROJECT_ID", "")
 AZURE_CONNECTION_STRING = os.getenv("AZURE_CONNECTION_STRING", "")
 
+# ============================================================================
 # CORS Configuration
+# ============================================================================
+
 ALLOWED_ORIGINS = [
     "http://localhost:3000",
     "http://127.0.0.1:3000",
@@ -44,22 +84,22 @@ ALLOWED_ORIGINS = [
     "*"  # Allow all origins for development
 ]
 
+# ============================================================================
 # Scanner Configuration
+# ============================================================================
+
 SCANNER_CONFIG = {
     "prompt_injection_threshold": 0.8,
     "toxicity_threshold": 0.5,
     "pii_threshold": 0.5,
     "secrets_threshold": 0.0,  # Binary detection for API keys, passwords, tokens
     "thread_pool_workers": 20
-    # 🔧 ADD NEW SCANNER THRESHOLDS HERE:
-    # "ban_topics_threshold": 0.7,
-    # "code_detection_threshold": 0.6,
-    # "sentiment_threshold": 0.5,
-    # "language_match_threshold": 0.8,
-    # ====================================================================
 }
 
+# ============================================================================
 # API Configuration
+# ============================================================================
+
 API_CONFIG = {
     "title": "Jailbreak-Protected LLM API - Concurrent",
     "description": "Secure LLM API with comprehensive jailbreak detection - Handles multiple concurrent bots",

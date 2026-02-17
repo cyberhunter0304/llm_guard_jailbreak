@@ -280,6 +280,203 @@ def get_processing_stats() -> Dict[str, Any]:
         return {"error": str(e)}
 
 
+def save_conversation(conversation_data: dict) -> bool:
+    """
+    Save a conversation to MongoDB conversations collection.
+    
+    Ensures data conforms to the standardized conversation schema defined in CONVERSATION_SCHEMA.md
+    
+    Args:
+        conversation_data: Dictionary with required fields:
+            - conversationId: unique ID
+            - botId: bot session ID
+            - userId: user ID
+            - threadId: thread ID
+            - model: LLM model name
+            - activity: {"role", "text", "timestamp"}
+            - validation: {"prompt", "is_safe", "blocked", "detections", "metrics", ...}
+    
+    Returns:
+        bool: True if saved successfully
+    """
+    try:
+        db = get_mongodb()
+        if db is None:
+            logger.error("MongoDB not connected - cannot save conversation")
+            return False
+        
+        conversations = db[MONGODB_CONVERSATIONS_COLLECTION]
+        
+        # Validate required fields exist
+        required_fields = ["conversationId", "botId", "userId", "threadId", "model", "activity", "validation"]
+        missing_fields = [f for f in required_fields if f not in conversation_data or conversation_data[f] is None]
+        
+        if missing_fields:
+            logger.warning(f"Conversation missing required fields: {missing_fields}")
+            return False
+        
+        # Validate activity structure
+        if not isinstance(conversation_data.get("activity"), dict):
+            logger.warning("Activity must be a dictionary")
+            return False
+        
+        activity_required = ["role", "text", "timestamp"]
+        activity_missing = [f for f in activity_required if f not in conversation_data["activity"]]
+        if activity_missing:
+            logger.warning(f"Activity missing fields: {activity_missing}")
+            return False
+        
+        # Validate validation structure
+        if not isinstance(conversation_data.get("validation"), dict):
+            logger.warning("Validation must be a dictionary")
+            return False
+        
+        validation_required = ["prompt", "is_safe", "blocked", "risk_level", "detections", "metrics", "timestamp"]
+        validation_missing = [f for f in validation_required if f not in conversation_data["validation"]]
+        if validation_missing:
+            logger.warning(f"Validation missing fields: {validation_missing}")
+            return False
+        
+        # Normalize the conversation data
+        normalized_data = {
+            "conversationId": str(conversation_data["conversationId"]),
+            "botId": str(conversation_data["botId"]),
+            "userId": str(conversation_data["userId"]),
+            "threadId": str(conversation_data["threadId"]),
+            "model": str(conversation_data["model"]),
+            "activity": {
+                "role": conversation_data["activity"].get("role", "user"),
+                "text": str(conversation_data["activity"].get("text", "")),
+                "timestamp": conversation_data["activity"].get("timestamp", now())
+            },
+            "validation": {
+                "prompt": str(conversation_data["validation"].get("prompt", "")),
+                "prompt_length": len(conversation_data["validation"].get("prompt", "")),
+                "is_safe": bool(conversation_data["validation"].get("is_safe", False)),
+                "blocked": bool(conversation_data["validation"].get("blocked", False)),
+                "risk_level": str(conversation_data["validation"].get("risk_level", "UNKNOWN")),
+                "detections": conversation_data["validation"].get("detections", {}),
+                "metrics": conversation_data["validation"].get("metrics", {}),
+                "timestamp": conversation_data["validation"].get("timestamp", now())
+            },
+            "processed": conversation_data.get("processed", False),
+            "createdAt": conversation_data.get("createdAt", now()),
+            "updatedAt": now()
+        }
+        
+        # Add optional fields if present
+        if conversation_data.get("block_reason"):
+            normalized_data["validation"]["block_reason"] = str(conversation_data["block_reason"])
+        
+        if conversation_data["validation"].get("blocked") and not conversation_data["validation"].get("is_safe"):
+            # Blocked messages should have block_reason
+            if "block_reason" not in normalized_data["validation"]:
+                normalized_data["validation"]["block_reason"] = conversation_data["validation"].get("message", "Security threat detected")
+        
+        if conversation_data["validation"].get("llm_response"):
+            normalized_data["validation"]["llm_response"] = str(conversation_data["validation"]["llm_response"])
+        
+        if conversation_data.get("security_log_id"):
+            normalized_data["security_log_id"] = str(conversation_data["security_log_id"])
+        
+        # Remove _id if present to allow insert
+        if "_id" in normalized_data:
+            del normalized_data["_id"]
+        
+        # Insert conversation
+        result = conversations.insert_one(normalized_data)
+        
+        logger.debug(f"Saved conversation {normalized_data['conversationId']} (thread: {normalized_data['threadId']})")
+        return True
+    
+    except Exception as e:
+        logger.error(f"Error saving conversation: {str(e)}")
+        return False
+
+
+def build_conversation(
+    bot_id: str,
+    prompt: str,
+    model: str,
+    is_safe: bool,
+    blocked: bool,
+    risk_level: str,
+    detections: dict,
+    metrics: dict,
+    llm_response: Optional[str] = None,
+    block_reason: Optional[str] = None,
+    scan_results: Optional[Any] = None,
+    request_timestamp: Optional[str] = None
+) -> dict:
+    """
+    Build a standardized conversation object following CONVERSATION_SCHEMA.md
+    
+    This ensures all conversations conform to the defined schema before being saved.
+    
+    Args:
+        bot_id: Bot session ID
+        prompt: Original user prompt
+        model: LLM model name
+        is_safe: Whether prompt passed security checks
+        blocked: Whether request was blocked
+        risk_level: Risk level (SAFE, MEDIUM, HIGH, CRITICAL)
+        detections: Security scanner detections dictionary
+        metrics: Performance metrics dictionary
+        llm_response: LLM response text (only when safe)
+        block_reason: Reason for blocking (only when blocked)
+        scan_results: Optional scan results object with .message attribute
+        request_timestamp: Optional custom timestamp
+    
+    Returns:
+        dict: Standardized conversation object ready for save_conversation()
+    """
+    import time as time_module
+    
+    timestamp = request_timestamp or now()
+    
+    # Extract user/thread IDs from botId
+    bot_parts = bot_id.split('_')
+    user_id = f"user_{bot_parts[1]}" if len(bot_parts) > 1 else f"user_{bot_id}"
+    thread_id = f"thread_{bot_parts[1]}" if len(bot_parts) > 1 else f"thread_{bot_id}"
+    
+    conversation = {
+        "conversationId": f"conv_{bot_id}_{int(time_module.time() * 1000)}",
+        "botId": bot_id,
+        "userId": user_id,
+        "threadId": thread_id,
+        "model": model,
+        "activity": {
+            "role": "user",
+            "text": prompt,
+            "timestamp": timestamp
+        },
+        "validation": {
+            "prompt": prompt,
+            "prompt_length": len(prompt),
+            "is_safe": is_safe,
+            "blocked": blocked,
+            "risk_level": risk_level,
+            "detections": detections,
+            "metrics": metrics,
+            "timestamp": timestamp
+        },
+        "processed": False
+    }
+    
+    # Add conditional fields based on safety status
+    if blocked and not is_safe:
+        # When blocked, include block reason
+        conversation["validation"]["block_reason"] = block_reason or (
+            scan_results.message if scan_results else "Security threat detected"
+        )
+    
+    if not blocked and is_safe and llm_response:
+        # When safe, include LLM response
+        conversation["validation"]["llm_response"] = llm_response
+    
+    return conversation
+
+
 def _get_default_security_log(bot_id: str) -> dict:
     """Get default empty security log structure"""
     return {

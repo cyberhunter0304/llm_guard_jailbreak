@@ -200,7 +200,7 @@ const AnalyticsDashboard = () => {
   const clearAllThreads = useCallback(async () => {
     try {
       await Promise.all(threads.map(thread => 
-        fetch(`${BACKEND_URL}/api/security-logs/${thread.thread_id}`, { method: 'DELETE' })
+        fetch(`${BACKEND_URL}/api/security-logs/${thread.thread_id || thread.bot_id}`, { method: 'DELETE' })
       ));
       await fetchAllThreads();
       return true;
@@ -377,8 +377,8 @@ const AnalyticsDashboard = () => {
   const getTopThreateningThreads = useMemo(() => 
     [...threads]
       .map(t => ({
-        id: t.thread_id.substring(0, 20) + '...',
-        fullId: t.thread_id,
+        id: (t.thread_id || 'unknown').substring(0, 20) + '...',
+        fullId: t.thread_id || 'unknown',
         threats: (t.pii_detections || 0) + (t.jailbreak_attempts || 0) + 
                 (t.toxicity_detections || 0) + (t.secrets_detections || 0)
       }))
@@ -398,7 +398,7 @@ const AnalyticsDashboard = () => {
 
   const handleDeleteThread = useCallback(async (threadId, e) => {
     e.stopPropagation();
-    if (window.confirm(`Delete thread ${threadId.substring(0, 24)}...?`)) {
+    if (window.confirm(`Delete thread ${(threadId || 'unknown').substring(0, 24)}...?`)) {
       await deleteThread(threadId);
     }
   }, [deleteThread]);
