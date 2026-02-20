@@ -202,6 +202,47 @@ def _get_timestamp(doc: Dict) -> str:
 
 
 # ============================================================================
+# LLM CALLER (sync wrapper — runs in its own thread with a fresh event loop)
+# ============================================================================
+
+def _call_llm_sync(
+    prompt: str,
+    model: str = None,
+    has_pii: bool = False,
+    message_id: str = "",
+) -> Optional[str]:
+    """
+    Call the LLM synchronously from a non-async context (the monitor's
+    process_message method). Runs in a dedicated thread with its own
+    event loop to avoid conflicting with the FastAPI event loop.
+    """
+    import asyncio as _asyncio
+    import concurrent.futures
+    from llm_client import call_llm
+
+    def run_in_thread():
+        loop = _asyncio.new_event_loop()
+        _asyncio.set_event_loop(loop)
+        try:
+            raw = loop.run_until_complete(
+                call_llm(prompt, model=model, has_pii=has_pii)
+            )
+            return raw.get("choices", [{}])[0].get("message", {}).get("content", "")
+        finally:
+            loop.close()
+
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(run_in_thread)
+            response = future.result(timeout=60)
+        logger.info(f"[monitor] LLM responded for msg={message_id}")
+        return response
+    except Exception as e:
+        logger.error(f"[monitor] LLM call failed for msg={message_id}: {e}")
+        return None
+
+
+# ============================================================================
 # MONITOR
 # ============================================================================
 
@@ -347,7 +388,6 @@ class ConversationMonitor:
                     "message_id": message_id, "bot_id": bot_id}
         scan_duration = round(time.time() - scan_start, 4)
 
-        # 4 — Build event record
         pii_data      = scan_results.detections.get("pii", {})
         pii_entities  = pii_data.get("entities", [])
         has_pii       = len(pii_entities) > 0
@@ -356,6 +396,20 @@ class ConversationMonitor:
         has_secrets   = pii_data.get("secrets_detected", False)
         is_blocked    = not scan_results.is_safe
 
+        # 4 — Call LLM only if safe (runs in its own thread/event loop)
+        llm_response = None
+        if not is_blocked:
+            prompt_for_llm = (
+                pii_data.get("anonymized_prompt") or text if has_pii else text
+            )
+            llm_response = _call_llm_sync(
+                prompt=prompt_for_llm,
+                model=doc.get("model") or None,
+                has_pii=has_pii,
+                message_id=message_id,
+            )
+
+        # 5 — Build and save security event
         security_event = {
             "message_id":        message_id,
             "thread_id":         thread_id,
@@ -365,6 +419,7 @@ class ConversationMonitor:
             "prompt":            text,
             "prompt_length":     len(text),
             "anonymized_prompt": pii_data.get("anonymized_prompt") if pii_entities else None,
+            "llm_response":      llm_response,
             "detections":        scan_results.detections,
             "risk_level":        scan_results.risk_level,
             "is_safe":           scan_results.is_safe,
@@ -377,7 +432,6 @@ class ConversationMonitor:
             },
         }
 
-        # 5 — Atomic write
         appended = append_security_event(
             bot_id=bot_id, message_id=message_id,
             security_event=security_event,
