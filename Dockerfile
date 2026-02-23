@@ -1,5 +1,5 @@
-# Use the official Python image
-FROM python:3.10-slim
+# Use Python 3.11 — fixes 'type' subscriptable error with transformers + numpy
+FROM python:3.11-slim
 
 # Set environment variables
 ENV PYTHONDONTWRITEBYTECODE=1
@@ -25,7 +25,7 @@ RUN python -m spacy download en_core_web_lg
 # Copy the entire backend application
 COPY . .
 
-# Create the security_logs directory (mounted as volume in prod)
+# Create the security_logs directory (fallback if volume not mounted)
 RUN mkdir -p security_logs
 
 # Expose the API port
