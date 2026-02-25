@@ -27,3 +27,5 @@ typing-extensions==4.12.2
 
 # Optional: Performance
 orjson==3.10.14
+
+redis==5.3.0

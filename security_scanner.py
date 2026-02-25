@@ -12,6 +12,7 @@ from pii_detector import ThreadSafePIIDetector
 from models import SecurityScanResult
 from config import SCANNER_CONFIG
 from datetime_utils import now
+from redis_cache import get_cached_result, cache_result
 
 logger = logging.getLogger(__name__)
 
@@ -327,9 +328,28 @@ class ConcurrentSecurityScanner:
     async def scan_prompt(self, prompt: str, bot_id: str = "unknown") -> SecurityScanResult:
         """
         Main async entry point for scanning.
-        This is what you call from FastAPI routes!
+
+        Cache layer (Redis, if configured):
+          1. Normalise + hash the prompt → look up in Redis
+          2. Cache HIT  → return instantly, skip all ONNX inference (~1-2s saved)
+          3. Cache MISS → run full parallel scan, then store result for next time
+
+        Warmup calls (bot_id == "__warmup__") bypass the cache so the dummy
+        request always exercises the real inference pipeline.
         """
-        return await self.scan_prompt_parallel(prompt, bot_id)
+        # Skip cache for internal warmup probes
+        if bot_id != "__warmup__":
+            cached = await get_cached_result(prompt)
+            if cached is not None:
+                return cached
+
+        result = await self.scan_prompt_parallel(prompt, bot_id)
+
+        # Store result (fire-and-forget; failure is logged but never raised)
+        if bot_id != "__warmup__":
+            await cache_result(prompt, result)
+
+        return result
     
     def scan_prompt_sync(self, prompt: str, bot_id: str = "unknown") -> SecurityScanResult:
         """

@@ -35,6 +35,7 @@ class SecurityScanResult(BaseModel):
     message: str
     timestamp: str
     scan_duration: float
+    from_cache: Optional[bool] = False   # True when result was served from Redis
 
 
 class ChatResponse(BaseModel):

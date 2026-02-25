@@ -8,7 +8,7 @@ import time
 import uuid
 from fastapi import APIRouter, HTTPException, status, BackgroundTasks
 from pydantic import BaseModel, Field, validator
-from config import MONGODB_CONVERSATIONS_COLLECTION, AZURE_DEPLOYMENT
+from config import MONGODB_CONVERSATIONS_COLLECTION, AZURE_DEPLOYMENT, DEFAULT_BOT_ID
 from datetime_utils import now
 from llm_client import call_llm
 from mongodb_storage import get_mongodb
@@ -71,7 +71,7 @@ class TestChatRequest(BaseModel):
         return v
 
 
-def _derive_ids(bot_id):
+def _derive_ids(bot_id: str):
     """Derive thread and user IDs from bot_id"""
     suffix = bot_id.split("_")[1] if "_" in bot_id else bot_id
     return f"thread_{suffix}", f"user_{suffix}"
@@ -134,7 +134,7 @@ async def test_chat(request: TestChatRequest, background_tasks: BackgroundTasks)
                 "message_id": message_id,
                 "thread_id": thread_id,
                 "conversation_id": conv_id,
-                "bot_id": request.bot_id,
+                "bot_id": DEFAULT_BOT_ID,
                 "timestamp": ts,
                 "prompt": request.prompt,
                 "prompt_length": len(request.prompt),
@@ -156,7 +156,7 @@ async def test_chat(request: TestChatRequest, background_tasks: BackgroundTasks)
             background_tasks.add_task(
                 asyncio.run,
                 store_security_event_async(
-                    bot_id=request.bot_id,
+                    thread_id=thread_id,
                     message_id=message_id,
                     security_event=security_event,
                     is_blocked=True,
@@ -164,6 +164,7 @@ async def test_chat(request: TestChatRequest, background_tasks: BackgroundTasks)
                     has_jailbreak=has_injection,
                     has_toxicity=has_toxicity,
                     has_secrets=has_secrets,
+                    bot_id=DEFAULT_BOT_ID,
                 )
             )
             # ================================================================
@@ -205,7 +206,7 @@ async def test_chat(request: TestChatRequest, background_tasks: BackgroundTasks)
             "message_id": message_id,
             "thread_id": thread_id,
             "conversation_id": conv_id,
-            "bot_id": request.bot_id,
+            "bot_id": DEFAULT_BOT_ID,
             "timestamp": ts,
             "prompt": request.prompt,
             "prompt_length": len(request.prompt),
@@ -226,7 +227,7 @@ async def test_chat(request: TestChatRequest, background_tasks: BackgroundTasks)
         background_tasks.add_task(
             asyncio.run,
             store_security_event_async(
-                bot_id=request.bot_id,
+                thread_id=thread_id,
                 message_id=message_id,
                 security_event=security_event,
                 is_blocked=False,
@@ -234,6 +235,7 @@ async def test_chat(request: TestChatRequest, background_tasks: BackgroundTasks)
                 has_jailbreak=has_injection,
                 has_toxicity=has_toxicity,
                 has_secrets=has_secrets,
+                bot_id=DEFAULT_BOT_ID,
             )
         )
         # ================================================================
@@ -353,7 +355,7 @@ async def chat(request: ChatRequest):
             "message_id": message_id,
             "conversation_id": conv_id,
             "thread_id": thread_id,
-            "bot_id": request.bot_id,
+            "bot_id": DEFAULT_BOT_ID,
             "timestamp": ts,
         }
 

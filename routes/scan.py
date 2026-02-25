@@ -24,6 +24,7 @@ from mongodb_storage import (
 )
 from security_scanner import ConcurrentSecurityScanner
 from storage import append_security_event
+from config import DEFAULT_BOT_ID
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api", tags=["Security"])
@@ -134,7 +135,7 @@ async def process_next_conversation():
     )
 
     append_security_event(
-        bot_id         = bot_id,
+        thread_id      = thread_id,
         message_id     = message_id,
         security_event = security_event,
         is_blocked     = is_blocked,
@@ -142,6 +143,7 @@ async def process_next_conversation():
         has_jailbreak  = has_jailbreak,
         has_toxicity   = has_toxicity,
         has_secrets    = has_secrets,
+        bot_id         = DEFAULT_BOT_ID,
     )
     mark_conversation_processed(conversation_id, bot_id)
 
@@ -206,7 +208,7 @@ async def process_bulk_conversations(count: int = Query(10, ge=1, le=200)):
         )
 
         append_security_event(
-            bot_id         = bot_id,
+            thread_id      = thread_id,
             message_id     = message_id,
             security_event = security_event,
             is_blocked     = is_blocked,
@@ -214,6 +216,7 @@ async def process_bulk_conversations(count: int = Query(10, ge=1, le=200)):
             has_jailbreak  = has_jailbreak,
             has_toxicity   = has_toxicity,
             has_secrets    = has_secrets,
+            bot_id         = DEFAULT_BOT_ID,
         )
         mark_conversation_processed(conversation_id, bot_id)
 

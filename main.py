@@ -213,3 +213,184 @@ async def shutdown_event():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False, workers=1)
+
+# ---------------------------------------------------------------------------
+# Cache management endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/api/cache/stats", tags=["Cache"])
+async def cache_stats():
+    """Redis scan-cache statistics (key count, TTL, version)."""
+    from redis_cache import get_stats
+    return {"success": True, **(await get_stats()), "timestamp": now()}
+
+
+@app.post("/api/cache/flush", tags=["Cache"])
+async def cache_flush():
+    """
+    Evict all cached scan results.
+    Use after updating scanner thresholds or models so stale results
+    are not served.
+    """
+    from redis_cache import flush_all
+    ok = await flush_all()
+    return {
+        "success": ok,
+        "message": "All scan cache entries evicted." if ok else "Nothing to flush (Redis not connected).",
+        "timestamp": now(),
+    }
+
+
+@app.delete("/api/cache/entry", tags=["Cache"])
+async def cache_invalidate_entry(prompt: str):
+    """
+    Evict the cached result for a single prompt.
+    Useful after a false-negative is reported.
+    """
+    from redis_cache import invalidate
+    evicted = await invalidate(prompt)
+    return {
+        "success": True,
+        "evicted": evicted,
+        "message": "Entry evicted." if evicted else "Key not found in cache.",
+        "timestamp": now(),
+    }
+
+
+@app.get("/api/cache/diagnose", tags=["Cache"])
+async def cache_diagnose():
+    """
+    🔍 Full Redis cache diagnostic — open this in your browser.
+    Checks: package installed, REDIS_URL set, ping, read/write, key count.
+    """
+    import os
+    report = {
+        "timestamp": now(),
+        "checks": {},
+        "verdict": None,
+        "fix": None,
+    }
+
+    # ── 1. Package installed? ──────────────────────────────────────────────
+    try:
+        import redis.asyncio as aioredis
+        report["checks"]["package_installed"] = {
+            "ok": True,
+            "detail": "redis package found"
+        }
+    except ImportError:
+        report["checks"]["package_installed"] = {
+            "ok": False,
+            "detail": "redis package NOT installed"
+        }
+        report["verdict"] = "FAILED"
+        report["fix"] = "Run:  pip install redis  then restart the server"
+        return report
+
+    # ── 2. REDIS_URL set? ─────────────────────────────────────────────────
+    redis_url = os.getenv("REDIS_URL", "")
+    if not redis_url:
+        report["checks"]["redis_url"] = {
+            "ok": False,
+            "detail": "REDIS_URL environment variable is not set"
+        }
+        report["verdict"] = "FAILED"
+        report["fix"] = "Add  REDIS_URL=redis://localhost:6379  to your .env file and restart"
+        return report
+
+    report["checks"]["redis_url"] = {
+        "ok": True,
+        "detail": f"REDIS_URL is set → {redis_url.split('@')[-1]}"   # hide password
+    }
+
+    # ── 3. Can we connect + ping? ─────────────────────────────────────────
+    try:
+        client = aioredis.from_url(redis_url, socket_connect_timeout=2, socket_timeout=2)
+        pong = await client.ping()
+        report["checks"]["ping"] = {"ok": True, "detail": f"PONG received: {pong}"}
+    except Exception as e:
+        report["checks"]["ping"] = {"ok": False, "detail": str(e)}
+        report["verdict"] = "FAILED"
+        report["fix"] = "Redis is unreachable. Make sure Redis server is running."
+        return report
+
+    # ── 4. Read / write test ──────────────────────────────────────────────
+    try:
+        await client.set("guardrail:_diag_test", "ok", ex=30)
+        val = await client.get("guardrail:_diag_test")
+        await client.delete("guardrail:_diag_test")
+        report["checks"]["read_write"] = {
+            "ok": val in ("ok", b"ok"),  # redis may return str or bytes
+            "detail": "SET + GET + DEL all succeeded"
+        }
+    except Exception as e:
+        report["checks"]["read_write"] = {"ok": False, "detail": str(e)}
+        report["verdict"] = "FAILED"
+        report["fix"] = "Redis connected but read/write failed — check permissions."
+        return report
+
+    # ── 5. How many cached scan keys exist right now? ─────────────────────
+    try:
+        prefix = os.getenv("REDIS_CACHE_PREFIX", "guardrail:scan:")
+        count = 0
+        async for _ in client.scan_iter(match=f"{prefix}*", count=100):
+            count += 1
+        report["checks"]["cached_scan_keys"] = {
+            "ok": True,
+            "detail": f"{count} scan result(s) currently cached"
+        }
+    except Exception as e:
+        report["checks"]["cached_scan_keys"] = {"ok": False, "detail": str(e)}
+
+    # ── 6. Simulate a real cache round-trip with "bitch" ──────────────────
+    try:
+        from redis_cache import get_cached_result, cache_result
+        from models import SecurityScanResult
+        from datetime_utils import now as _now
+
+        test_prompt = "bitch"
+
+        # Check if it's already cached from a real scan
+        cached = await get_cached_result(test_prompt)
+        if cached:
+            report["checks"]["live_cache_hit"] = {
+                "ok": True,
+                "detail": f"'bitch' is already cached → risk={cached.risk_level}, safe={cached.is_safe}"
+            }
+        else:
+            # Write a dummy entry, read it back, then delete
+            dummy = SecurityScanResult(
+                is_safe=False,
+                detections={"toxicity": {"detected": True, "risk_score": 0.95}},
+                risk_level="CRITICAL",
+                message="test",
+                timestamp=_now(),
+                scan_duration=0.001,
+            )
+            await cache_result(test_prompt, dummy)
+            readback = await get_cached_result(test_prompt)
+            await client.delete(f"{prefix}{__import__('hashlib').sha256('bitch'.encode()).hexdigest()}")
+
+            report["checks"]["live_cache_hit"] = {
+                "ok": readback is not None,
+                "detail": (
+                    "Round-trip write→read succeeded — cache is working correctly"
+                    if readback else "Write succeeded but read returned None — unexpected"
+                )
+            }
+    except Exception as e:
+        report["checks"]["live_cache_hit"] = {"ok": False, "detail": str(e)}
+
+    await client.aclose()
+
+    # ── Final verdict ─────────────────────────────────────────────────────
+    all_ok = all(v["ok"] for v in report["checks"].values())
+    report["verdict"] = "✅ CACHE IS WORKING" if all_ok else "⚠️ PARTIAL — see checks above"
+    if all_ok:
+        report["fix"] = None
+        report["note"] = (
+            "Every repeated prompt will now return from cache in ~5ms "
+            "instead of running the full 1-2s scan pipeline."
+        )
+
+    return report

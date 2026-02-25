@@ -118,6 +118,13 @@ AVAILABLE_MODELS = [
     "gpt-4-turbo",
 ]
 
+# ============================================================================
+# Default Tenant Bot ID
+# ============================================================================
+# Single canonical bot identity used across the entire system.
+# All requests, scans, and logs are attributed to this bot.
+DEFAULT_BOT_ID = "bot_jonathan"
+
 # Logging Configuration
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 
