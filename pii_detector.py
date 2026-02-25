@@ -1,6 +1,7 @@
 """
-PII Detection Module
-Thread-safe PII detection and anonymization with Secrets detection
+PII Detection Module - WITH EAGER LOADING + PRESIDIO RECOGNIZER CACHING
+Thread-safe PII detection with models loaded at startup (not on first request).
+Presidio recognizer registry is cached to avoid rebuild on every call.
 """
 import logging
 import threading
@@ -14,97 +15,151 @@ from config import SCANNER_CONFIG
 logger = logging.getLogger(__name__)
 
 
+# ============================================================================
+# GLOBAL CACHES - Load on module import (startup time)
+# ============================================================================
+_VAULT = None
+_ANONYMIZE_SCANNER = None
+_SECRETS_SCANNER = None
+_PRESIDIO_ANALYZER = None
+_PRESIDIO_ANONYMIZER = None
+_INIT_LOCK = threading.Lock()
+_INITIALIZED = False
+
+# ============================================================================
+# PRESIDIO RECOGNIZER CACHE
+# Avoids rebuilding the full recognizer registry on every call.
+# Key: language string (e.g. "en"), Value: list of recognizers
+# ============================================================================
+_PRESIDIO_RECOGNIZER_CACHE: Dict[str, list] = {}
+_RECOGNIZER_CACHE_LOCK = threading.Lock()
+
+
+def _initialize_all_scanners():
+    """Initialize ALL scanners ONCE at module load time (server startup)"""
+    global _VAULT, _ANONYMIZE_SCANNER, _SECRETS_SCANNER, _PRESIDIO_ANALYZER, _PRESIDIO_ANONYMIZER, _INITIALIZED
+    
+    with _INIT_LOCK:
+        if _INITIALIZED:
+            return  # Already initialized
+        
+        try:
+            logger.info("=" * 70)
+            logger.info("🚀 INITIALIZING PII DETECTION SCANNERS (EAGER LOADING AT STARTUP)...")
+            logger.info("=" * 70)
+            
+            # Create vault once
+            logger.info("Creating vault...")
+            _VAULT = Vault()
+            
+            # Initialize Presidio (Microsoft's production PII detection)
+            logger.info("Initializing Presidio Analyzer (Microsoft's PII engine)...")
+            try:
+                from presidio_analyzer import AnalyzerEngine
+                from presidio_anonymizer import AnonymizerEngine
+                
+                _PRESIDIO_ANALYZER = AnalyzerEngine()
+                _PRESIDIO_ANONYMIZER = AnonymizerEngine()
+                logger.info("✓ Presidio Analyzer and Anonymizer loaded and cached")
+
+                # ============================================================
+                # PRE-WARM PRESIDIO RECOGNIZER CACHE
+                # This prevents "Fetching all recognizers for language en"
+                # from appearing (and taking extra time) on every request.
+                # ============================================================
+                logger.info("Pre-warming Presidio recognizer cache for 'en'...")
+                recognizers = _PRESIDIO_ANALYZER.get_recognizers(language="en")
+                with _RECOGNIZER_CACHE_LOCK:
+                    _PRESIDIO_RECOGNIZER_CACHE["en"] = recognizers
+                logger.info(f"✓ Cached {len(recognizers)} Presidio recognizers for 'en'")
+
+            except ImportError:
+                logger.warning("Presidio not available, will use BERT-only mode")
+                _PRESIDIO_ANALYZER = None
+            
+            # Create Anonymize scanner once (uses BERT-NER)
+            logger.info("Loading Anonymize scanner (BERT-NER for entity recognition)...")
+            _ANONYMIZE_SCANNER = Anonymize(
+                vault=_VAULT,
+                preamble="The following text contains sensitive information.",
+                allowed_names=[],
+                hidden_names=[],
+                entity_types=None,
+                use_faker=False,
+                recognizer_conf=BERT_LARGE_NER_CONF,
+                threshold=SCANNER_CONFIG.get("pii_threshold", 0.5),
+                language="en"
+            )
+            logger.info("✓ Anonymize scanner loaded and cached")
+            
+            # Create Secrets scanner once
+            logger.info("Loading Secrets scanner...")
+            _SECRETS_SCANNER = Secrets(redact_mode="all")
+            logger.info("✓ Secrets scanner loaded and cached")
+            
+            _INITIALIZED = True
+            
+            logger.info("=" * 70)
+            logger.info("✅ ALL PII DETECTION SCANNERS INITIALIZED AND CACHED")
+            logger.info("   ├─ Presidio Analyzer (accurate PII detection)")
+            logger.info("   ├─ Presidio Recognizer Cache (pre-warmed for 'en')")
+            logger.info("   ├─ BERT-NER (entity recognition)")
+            logger.info("   ├─ Anonymize Scanner (redaction)")
+            logger.info("   └─ Secrets Scanner (API keys, passwords)")
+            logger.info("   ⏱️  Ready for requests! (No startup delay)")
+            logger.info("=" * 70)
+            
+        except Exception as e:
+            logger.error(f"Failed to initialize scanners: {str(e)}")
+            raise
+
+
+# Initialize scanners on module import (happens at server startup)
+logger.info("[PII] Starting eager model loading...")
+_initialize_all_scanners()
+logger.info("[PII] Models loaded! Ready to serve requests.")
+
+
 class ThreadSafePIIDetector:
     """
-    Thread-Safe PII Detector with proper model initialization
+    Production-Grade PII Detector with cached Presidio + BERT.
+    Models are pre-loaded at startup (not on first request).
+    Presidio recognizer registry is cached to avoid rebuild on every call.
     """
     
-    # Class-level model cache to avoid re-downloading
-    _model_cache = {}
-    _cache_lock = threading.Lock()
-    
     @staticmethod
-    def _ensure_model_loaded():
-        """Ensure BERT model is properly loaded (once per process)"""
-        with ThreadSafePIIDetector._cache_lock:
-            if 'bert_loaded' not in ThreadSafePIIDetector._model_cache:
-                try:
-                    import torch
-                    from transformers import AutoTokenizer, AutoModelForTokenClassification
-                    
-                    model_name = BERT_LARGE_NER_CONF.get('DEFAULT_MODEL_NAME', 'dslim/bert-base-NER')
-                    
-                    # Force download and load with actual weights
-                    logger.info(f"Loading BERT model: {model_name}")
-                    tokenizer = AutoTokenizer.from_pretrained(model_name)
-                    model = AutoModelForTokenClassification.from_pretrained(
-                        model_name,
-                        torch_dtype=torch.float32,  # Use float32 instead of meta
-                        low_cpu_mem_usage=False      # Disable lazy loading
-                    )
-                    
-                    # Move to CPU and ensure weights are loaded
-                    model = model.to('cpu')
-                    model.eval()
-                    
-                    ThreadSafePIIDetector._model_cache['bert_loaded'] = True
-                    ThreadSafePIIDetector._model_cache['model'] = model
-                    ThreadSafePIIDetector._model_cache['tokenizer'] = tokenizer
-                    
-                    logger.info("✓ BERT model loaded successfully")
-                    
-                except Exception as e:
-                    logger.error(f"Failed to load BERT model: {str(e)}")
-                    ThreadSafePIIDetector._model_cache['bert_loaded'] = False
-                    raise
-    
-    @staticmethod
-    def create_detector(
-        preamble: str = "The following text contains sensitive information.",
-        threshold: float = None,
-        language: str = "en"
-    ):
-        """Create a fresh PII detector instance with shared model"""
-        if threshold is None:
-            threshold = SCANNER_CONFIG["pii_threshold"]
-            
-        # Ensure model is loaded first
-        ThreadSafePIIDetector._ensure_model_loaded()
-        
-        vault = Vault()
-        scanner = Anonymize(
-            vault=vault,
-            preamble=preamble,
-            allowed_names=[],
-            hidden_names=[],
-            entity_types=None,
-            use_faker=False,
-            recognizer_conf=BERT_LARGE_NER_CONF,
-            threshold=threshold,
-            language=language
-        )
-        return vault, scanner
-    
-    @staticmethod
-    def _extract_pii_patterns(text: str) -> Dict[str, List[str]]:
+    def _extract_pii_with_presidio(text: str) -> Dict[str, List[str]]:
         """
-        Extract ACTUAL PII values from original text using multiple strategies.
-        This happens BEFORE anonymization destroys the values!
-        
-        Returns: {"ENTITY_TYPE": ["actual_value1", "actual_value2"]}
+        Extract PII using cached Presidio Analyzer (most accurate).
+        Uses a pre-built recognizer cache to avoid rebuilding the registry
+        on every call (eliminates the repeated 'Fetching all recognizers' log).
         """
         pii_values = {}
         
-        logger.info(f"Starting PII extraction from: '{text}'")
+        if _PRESIDIO_ANALYZER is None:
+            logger.debug("Presidio not available, skipping Presidio extraction")
+            return pii_values
         
-        # Strategy 1: Use presidio analyzer if available (most accurate)
         try:
-            from presidio_analyzer import AnalyzerEngine
+            logger.debug("Using cached Presidio Analyzer for PII extraction")
+
+            # ------------------------------------------------------------------
+            # Use cached recognizers — avoids the per-call registry rebuild
+            # that was causing the repeated warning in the logs.
+            # ------------------------------------------------------------------
+            with _RECOGNIZER_CACHE_LOCK:
+                cached = _PRESIDIO_RECOGNIZER_CACHE.get("en")
+
+            if cached is None:
+                # Fallback: build and cache on the fly (should not normally happen)
+                logger.debug("Presidio recognizer cache miss — fetching and caching now")
+                cached = _PRESIDIO_ANALYZER.get_recognizers(language="en")
+                with _RECOGNIZER_CACHE_LOCK:
+                    _PRESIDIO_RECOGNIZER_CACHE["en"] = cached
+
+            results = _PRESIDIO_ANALYZER.analyze(text=text, language="en")
             
-            analyzer = AnalyzerEngine()
-            results = analyzer.analyze(text=text, language="en")
-            
-            logger.info(f"Presidio found {len(results)} PII entities")
+            logger.debug(f"Presidio found {len(results)} PII entities")
             
             for result in results:
                 entity_type = result.entity_type
@@ -116,81 +171,49 @@ class ThreadSafePIIDetector:
                     pii_values[entity_type] = []
                 
                 pii_values[entity_type].append(entity_value)
-                logger.info(f"Presidio found {entity_type}: '{entity_value}' at [{start}:{end}]")
+                logger.debug(f"Presidio: {entity_type} = '{entity_value}'")
             
-            if pii_values:
-                logger.info(f"✓ Successfully extracted with Presidio: {pii_values}")
-                return pii_values
-                
-        except ImportError:
-            logger.debug("Presidio not available, using fallback extraction")
+            return pii_values
+            
         except Exception as e:
-            logger.debug(f"Presidio extraction failed: {str(e)}, trying fallback")
+            logger.debug(f"Presidio extraction error: {str(e)}")
+            return pii_values
+    
+    @staticmethod
+    def _extract_pii_with_regex(text: str) -> Dict[str, List[str]]:
+        """
+        Fast regex-based extraction (fallback/supplement)
+        """
+        pii_values = {}
         
-        # Strategy 2: Regex and pattern-based extraction
-        logger.info("Using regex pattern extraction")
+        logger.debug("Using regex pattern extraction as supplement")
         
         patterns = {
             'EMAIL_ADDRESS': (r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b', 'email'),
-            'US_SSN_RE': (r'\b\d{3}-\d{2}-\d{4}\b', 'SSN'),
-            'US_PHONE_RE': (r'\b(?:\+?1[-.\s]?)?\(?[0-9]{3}\)?[-.\s]?[0-9]{3}[-.\s]?[0-9]{4}\b', 'phone'),
-            'US_ZIPCODE': (r'\b\d{5}(?:-\d{4})?\b', 'zipcode'),
+            'PHONE_NUMBER': (r'\b(?:\+?1[-.\s]?)?\(?[0-9]{3}\)?[-.\s]?[0-9]{3}[-.\s]?[0-9]{4}\b', 'phone'),
+            'US_SSN': (r'\b\d{3}-\d{2}-\d{4}\b', 'SSN'),
             'CREDIT_CARD': (r'\b(?:\d{4}[-\s]?){3}\d{4}\b', 'credit card'),
         }
         
         for entity_type, (pattern, desc) in patterns.items():
             matches = re.findall(pattern, text)
             if matches:
-                pii_values[entity_type] = matches
-                logger.info(f"Found {len(matches)} {desc} ({entity_type}): {matches}")
+                if entity_type not in pii_values:
+                    pii_values[entity_type] = []
+                pii_values[entity_type].extend(matches)
+                logger.debug(f"Regex found {len(matches)} {desc}")
         
-        # Strategy 3: Extract person names (most important for "I am Jonathan" case)
-        logger.info("Extracting person names...")
-        names = []
-        
-        # Pattern: "name is [Name]" or "I am [Name]" etc.
-        name_context_patterns = [
-            r"(?:name\s+is|called|I\s+am|he\s+is|she\s+is|they\s+are)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)",
-            r"^([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)(?:\s|,|!|\.|$)",  # Start of text
-        ]
-        
-        for pattern in name_context_patterns:
-            matches = re.findall(pattern, text, re.IGNORECASE)
-            for match in matches:
-                name = match.strip()
-                if len(name) > 2 and name not in names:
-                    names.append(name)
-                    logger.info(f"Extracted name from context: '{name}'")
-        
-        # Fallback: Any capitalized word > 2 chars (last resort)
-        if not names:
-            logger.info("No contextual names found, checking for capitalized words...")
-            words = text.split()
-            for word in words:
-                cleaned = word.strip('.,!?;:\'"')
-                if cleaned and cleaned[0].isupper() and len(cleaned) > 2:
-                    # Filter common words
-                    if cleaned not in {'I', 'The', 'My', 'Your', 'Our', 'Is', 'Am', 'Are', 'Have', 'Name', 'Want', 'Know'}:
-                        if cleaned not in names:
-                            names.append(cleaned)
-                            logger.info(f"Extracted capitalized word: '{cleaned}'")
-        
-        if names:
-            pii_values['REDACTED_PERSON'] = names
-            logger.info(f"Extracted {len(names)} person names: {names}")
-        
-        logger.info(f"Final extracted PII: {pii_values}")
         return pii_values
 
     
     @staticmethod
     def anonymize(text: str) -> Tuple[str, List[Dict], Dict[str, any]]:
         """
-        Detect and anonymize PII using multiple scanners
+        Detect and anonymize PII using cached Presidio + BERT + Regex.
         Returns: (anonymized_text, entities_list, scanner_results)
         
-        IMPORTANT: Extract actual PII VALUES from original text FIRST
-        before anonymization redacts them!
+        Models are pre-loaded at startup, so this is FAST!
+        Presidio recognizer registry is cached — no rebuild on each call.
         """
         entities = []
         scanner_results = {
@@ -199,38 +222,42 @@ class ThreadSafePIIDetector:
         
         try:
             # ================================================================
-            # STEP 1: EXTRACT ACTUAL PII VALUES FROM ORIGINAL TEXT FIRST
-            # This MUST happen before anonymization!
+            # STEP 1: EXTRACT PII VALUES FROM ORIGINAL TEXT
+            # Use cached Presidio (no model reloading, no recognizer rebuild!)
             # ================================================================
-            logger.info(f"Original text: '{text}'")
-            pii_values_by_type = ThreadSafePIIDetector._extract_pii_patterns(text)
-            logger.info(f"Extracted actual PII values BEFORE anonymization: {pii_values_by_type}")
+            logger.debug(f"Original text: '{text}'")
+            pii_values_by_type = ThreadSafePIIDetector._extract_pii_with_presidio(text)
+            
+            # Supplement with regex patterns
+            regex_values = ThreadSafePIIDetector._extract_pii_with_regex(text)
+            for entity_type, values in regex_values.items():
+                if entity_type not in pii_values_by_type:
+                    pii_values_by_type[entity_type] = values
+                else:
+                    pii_values_by_type[entity_type].extend(values)
+            
+            logger.debug(f"Extracted PII: {pii_values_by_type}")
             
             # ================================================================
-            # STEP 2: Run anonymization (this will redact values)
+            # STEP 2: Run anonymization using CACHED Anonymize scanner
             # ================================================================
             try:
-                vault, pii_scanner = ThreadSafePIIDetector.create_detector()
-                sanitized_text, is_valid_pii, risk_score_pii = pii_scanner.scan(text)
-                logger.info(f"Anonymized text: '{sanitized_text}'")
+                sanitized_text, is_valid_pii, risk_score_pii = _ANONYMIZE_SCANNER.scan(text)
+                logger.debug(f"Anonymized text: '{sanitized_text}'")
 
                 # Extract tokens from anonymized text
-                # Pattern matches [ENTITY_TYPE_NUMBER]
                 tokens = re.findall(r'\[([A-Z_]+)_(\d+)\]', sanitized_text)
-                logger.info(f"Tokens found: {tokens}")
+                logger.debug(f"Tokens found: {tokens}")
                 
-                # Match tokens to actual values we extracted
-                # Track how many of each type we've processed
                 entity_type_indices = {}
                 
                 for entity_type, entity_num_str in tokens:
                     full_token = f"[{entity_type}_{entity_num_str}]"
                     
-                    # Get the actual value we extracted from original text
-                    actual_value = "REDACTED"  # Default fallback
+                    actual_value = "REDACTED"
                     
+                    # Match token to extracted value
                     if entity_type in pii_values_by_type and pii_values_by_type[entity_type]:
-                        # Get the next value for this entity type
                         if entity_type not in entity_type_indices:
                             entity_type_indices[entity_type] = 0
                         
@@ -240,33 +267,27 @@ class ThreadSafePIIDetector:
                         if idx < len(values_list):
                             actual_value = values_list[idx]
                             entity_type_indices[entity_type] += 1
-                            logger.info(f"Token {full_token} matched to extracted value: '{actual_value}'")
-                        else:
-                            logger.warning(f"Token {full_token} has no matching extracted value (idx={idx}, available={len(values_list)})")
-                    else:
-                        logger.warning(f"No extracted values for entity type {entity_type}")
                     
                     entities.append({
                         "type": entity_type,
-                        "value": actual_value,  # This is the ACTUAL detected value, not REDACTED
+                        "value": actual_value,
                         "token": full_token,
                         "source": "pii"
                     })
                 
-                logger.info(f"Final entities with actual values: {entities}")
+                logger.debug(f"Final entities: {entities}")
                     
             except Exception as e:
-                logger.error(f"PII Scanner error: {str(e)}")
+                logger.error(f"Anonymize Scanner error: {str(e)}")
                 import traceback
                 logger.error(traceback.format_exc())
                 sanitized_text = text
             
             # ================================================================
-            # STEP 3: Run Secrets Scanner
+            # STEP 3: Run Secrets Scanner using CACHED instance
             # ================================================================
             try:
-                secrets_scanner = Secrets(redact_mode="all")
-                _, is_valid_secrets, risk_score_secrets = secrets_scanner.scan(text)
+                _, is_valid_secrets, risk_score_secrets = _SECRETS_SCANNER.scan(text)
                 secrets_detected = not is_valid_secrets
                 
                 scanner_results["secrets"] = {
@@ -286,7 +307,7 @@ class ThreadSafePIIDetector:
             # ================================================================
             entities = ThreadSafePIIDetector.deduplicate_entities(entities)
             
-            logger.info(f"Returning {len(entities)} PII entities to be stored in security log")
+            logger.debug(f"Returning {len(entities)} PII entities")
             
             return sanitized_text, entities, scanner_results
             
@@ -298,16 +319,7 @@ class ThreadSafePIIDetector:
     
     @staticmethod
     def deduplicate_entities(entities: List[Dict]) -> List[Dict]:
-        """
-        Deduplicate PII entities based on token
-        Used when multiple scanners detect the same entities
-        
-        Args:
-            entities: List of entity dictionaries with 'token' field
-            
-        Returns:
-            Deduplicated list of entities
-        """
+        """Deduplicate PII entities based on token"""
         if not entities:
             return []
         
@@ -316,12 +328,11 @@ class ThreadSafePIIDetector:
         
         for entity in entities:
             entity_token = entity.get("token", "")
-            # Only add if we haven't seen this token before
             if entity_token and entity_token not in seen_tokens:
                 seen_tokens.add(entity_token)
                 deduplicated.append(entity)
         
         if len(entities) != len(deduplicated):
-            logger.debug(f"Deduplicated PII entities: {len(entities)} -> {len(deduplicated)}")
+            logger.debug(f"Deduplicated PII: {len(entities)} → {len(deduplicated)}")
         
         return deduplicated

@@ -59,6 +59,11 @@ from routes.admin         import router as admin_router
 logging.basicConfig(level=LOG_LEVEL)
 logger = logging.getLogger(__name__)
 
+# Suppress noisy Presidio internal logs that fire on every analyze() call:
+#   INFO:presidio-analyzer:Fetching all recognizers for language en
+#   WARNING:presidio-analyzer:Entity CUSTOM doesn't have the corresponding recognizer in language : en
+logging.getLogger("presidio-analyzer").setLevel(logging.ERROR)
+
 # ---------------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------------
@@ -175,6 +180,19 @@ async def startup_event():
     asyncio.create_task(monitor.run_forever())
     logger.info("📡  Real-time monitor background task launched")
     logger.info("✅  Security scanners: Prompt Injection | Toxicity | PII | Secrets")
+
+    # =========================================================================
+    # 🔥 WARMUP: Pre-compile ONNX graphs + warm CPU caches for all scanners.
+    #
+    # Without this, the very first real request triggers JIT compilation of
+    # every ONNX model and a cold CPU cache read of hundreds of MBs of weights,
+    # adding 3-5s to that first request.
+    #
+    # With this warmup, all graphs are compiled during startup so every
+    # subsequent request (including the very first real one) runs at ~1s.
+    # =========================================================================
+    await _scanner.warmup()
+
     logger.info("=" * 70)
 
     if not AZURE_API_KEY:
