@@ -3,15 +3,16 @@ Jailbreak-Protected LLM API Endpoint
 FastAPI with OpenRouter GPT-4o mini integration and comprehensive jailbreak detection
 """
 
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, status
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field, field_validator
 from llm_guard.input_scanners import PromptInjection, Language, Toxicity
 from llm_guard.input_scanners.language import MatchType
 import httpx
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 import logging
 from typing import Optional, Dict, Any, List
 
@@ -19,37 +20,13 @@ from typing import Optional, Dict, Any, List
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Initialize FastAPI app
-app = FastAPI(
-    title="Jailbreak-Protected LLM API",
-    description="Secure LLM API with comprehensive jailbreak detection",
-    version="1.0.0",
-    docs_url="/docs",
-    redoc_url="/redoc"
-)
-
-# CORS Configuration - FIXED to allow React frontend
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",      # React dev server
-        "http://127.0.0.1:3000",      # Alternative localhost
-        "http://localhost:8000",      # If serving from same port
-        "http://0.0.0.0:8000",        # Fallback
-    ],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
 # Initialize scanners
 prompt_injection_scanner = PromptInjection(threshold=0.8)
 language_scanner = Language(valid_languages=["en"], match_type=MatchType.FULL, threshold=0.8)
 toxicity_scanner = Toxicity(threshold=0.5)
 
 # OpenRouter configuration
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "") 
-print("OPEN ROUTER API KEY SET")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 
@@ -58,7 +35,8 @@ class ChatRequest(BaseModel):
     prompt: str = Field(..., min_length=1, max_length=10000, description="User prompt")
     model: str = Field(default="openai/gpt-4o-mini", description="LLM model to use")
 
-    @validator('prompt')
+    @field_validator('prompt')
+    @classmethod
     def validate_prompt(cls, v):
         if not v or not isinstance(v, str):
             raise ValueError("Prompt must be a non-empty string")
@@ -68,7 +46,8 @@ class ChatRequest(BaseModel):
 class ScanRequest(BaseModel):
     prompt: str = Field(..., min_length=1, max_length=10000, description="Prompt to scan")
     
-    @validator('prompt')
+    @field_validator('prompt')
+    @classmethod
     def validate_prompt(cls, v):
         if not v or not isinstance(v, str):
             raise ValueError("Prompt must be a non-empty string")
@@ -143,7 +122,7 @@ class JailbreakDetector:
             "detections": {},
             "risk_level": "SAFE",
             "message": "Prompt passed all security checks",
-            "timestamp": datetime.utcnow().isoformat()
+            "timestamp": datetime.now(timezone.utc).isoformat()
         }
         
         max_risk_score = 0.0
@@ -191,6 +170,54 @@ class JailbreakDetector:
 
 
 detector = JailbreakDetector()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Log startup information"""
+    logger.info("=" * 80)
+    logger.info("🚀 Starting Jailbreak-Protected LLM API (FastAPI)")
+    logger.info("=" * 80)
+    logger.info(f"✓ Loaded {len(detector.scanners)} security scanners")
+    logger.info("✓ CORS enabled for React frontend")
+    logger.info("✓ Endpoints:")
+    logger.info("  - GET  /health       - Health check")
+    logger.info("  - POST /api/chat     - Protected chat endpoint")
+    logger.info("  - POST /api/scan     - Security scan only")
+    logger.info("  - GET  /api/stats    - API statistics")
+    logger.info("  - GET  /docs         - Interactive API documentation")
+    logger.info("  - GET  /redoc        - Alternative API documentation")
+    logger.info("=" * 80)
+
+    if not OPENROUTER_API_KEY:
+        logger.warning("⚠️  OPENROUTER_API_KEY not set! Set it as environment variable.")
+        logger.warning("   Export it: export OPENROUTER_API_KEY='your-key-here'")
+    yield
+
+
+# Initialize FastAPI app
+app = FastAPI(
+    title="Jailbreak-Protected LLM API",
+    description="Secure LLM API with comprehensive jailbreak detection",
+    version="1.0.0",
+    docs_url="/docs",
+    redoc_url="/redoc",
+    lifespan=lifespan
+)
+
+# CORS Configuration - FIXED to allow React frontend
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:3000",      # React dev server
+        "http://127.0.0.1:3000",      # Alternative localhost
+        "http://localhost:8000",      # If serving from same port
+        "http://0.0.0.0:8000",        # Fallback
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 async def call_openrouter(prompt: str, model: str = "openai/gpt-4o-mini") -> Dict[str, Any]:
@@ -242,7 +269,7 @@ async def health_check():
     return HealthResponse(
         status="healthy",
         service="Jailbreak-Protected LLM API",
-        timestamp=datetime.utcnow().isoformat(),
+        timestamp=datetime.now(timezone.utc).isoformat(),
         scanners_active=len(detector.scanners)
     )
 
@@ -277,7 +304,7 @@ async def chat(request: ChatRequest):
                     "success": False,
                     "error": "Jailbreak attempt detected",
                     "message": scan_results.message,
-                    "security_scan": scan_results.dict(),
+                    "security_scan": scan_results.model_dump(),
                     "blocked": True
                 }
             )
@@ -303,7 +330,7 @@ async def chat(request: ChatRequest):
             security_scan=scan_results,
             model=request.model,
             usage=llm_response.get("usage", {}),
-            timestamp=datetime.utcnow().isoformat()
+            timestamp=datetime.now(timezone.utc).isoformat()
         )
         
     except HTTPException:
@@ -348,7 +375,7 @@ async def get_stats():
         scanners={
             "prompt_injection": {
                 "name": "Prompt Injection Scanner",
-                "threshold": 0.5,
+                "threshold": 0.8,
                 "description": "Detects prompt injection and jailbreak attempts"
             },
             "language": {
@@ -368,28 +395,6 @@ async def get_stats():
             "anthropic/claude-3.5-sonnet"
         ]
     )
-
-
-@app.on_event("startup")
-async def startup_event():
-    """Log startup information"""
-    logger.info("=" * 80)
-    logger.info("🚀 Starting Jailbreak-Protected LLM API (FastAPI)")
-    logger.info("=" * 80)
-    logger.info(f"✓ Loaded {len(detector.scanners)} security scanners")
-    logger.info("✓ CORS enabled for React frontend")
-    logger.info("✓ Endpoints:")
-    logger.info("  - GET  /health       - Health check")
-    logger.info("  - POST /api/chat     - Protected chat endpoint")
-    logger.info("  - POST /api/scan     - Security scan only")
-    logger.info("  - GET  /api/stats    - API statistics")
-    logger.info("  - GET  /docs         - Interactive API documentation")
-    logger.info("  - GET  /redoc        - Alternative API documentation")
-    logger.info("=" * 80)
-    
-    if not OPENROUTER_API_KEY:
-        logger.warning("⚠️  OPENROUTER_API_KEY not set! Set it as environment variable.")
-        logger.warning("   Export it: export OPENROUTER_API_KEY='your-key-here'")
 
 
 if __name__ == "__main__":
